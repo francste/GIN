@@ -67,10 +67,11 @@ class MockSerial : public Print {
   std::deque<char> input;
   std::string output;
   bool txBlocked = false;
+  int txSpace = 64;
   void begin(unsigned long) {}
   int available() { return int(input.size()); }
   int read() { char c = input.front(); input.pop_front(); return c; }
-  int availableForWrite() { return txBlocked ? 0 : 64; }
+  int availableForWrite() { return txBlocked ? 0 : txSpace; }
   size_t write(uint8_t value) override {
     if (txBlocked) throw std::runtime_error("scrittura UART bloccante durante il controllo");
     output.push_back(char(value));

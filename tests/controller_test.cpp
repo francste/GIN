@@ -266,12 +266,50 @@ static void encoder_counter_rollover() {
 }
 
 static void congested_serial_does_not_extend_motor_on() {
-  reset(); Serial.txBlocked = true; ready(); edge(3000);
+  reset(); Serial.output.clear(); Serial.txBlocked = true; ready(); edge(3000);
   for (uint64_t ms = 3001; ms <= 3200; ++ms) {
     Serial.receive("a\na\na\na\n"); tick(ms);
   }
   assert(hardware::levels[3] == LOW && stato == ATTENDI_ARRESTO);
   assert(Serial.output.empty());
+}
+
+static void serial_logs_each_change_once_and_keeps_periodic_status() {
+  reset();
+  assert(Serial.output == "STATO,0,FERMO->PRE_GONFIAGGIO\n");
+  Serial.output.clear();
+  tick(999); assert(Serial.output.empty());
+  tick(1000); tick(1001);
+  assert(Serial.output == "S,0,P,200,N,0,T,0\n");
+
+  Serial.output.clear(); tick(2500);
+  assert(Serial.output == "STATO,2500,PRE_GONFIAGGIO->ATTENDI_ARRESTO\n"
+                          "S,1,P,200,N,0,T,0\n");
+  Serial.output.clear(); tick(2800); edge(3000); tick(3001); edge(3100); tick(3200);
+  assert(Serial.output == "STATO,2800,ATTENDI_ARRESTO->ATTENDI_FRONTE\n"
+                          "STATO,3000,ATTENDI_FRONTE->MOTOR_ON\n"
+                          "STATO,3200,MOTOR_ON->ATTENDI_ARRESTO\n");
+
+  Serial.output.clear(); Serial.receive("s"); tick(3201);
+  Serial.receive("s"); tick(3202);
+  Serial.receive("a"); tick(3203);
+  assert(Serial.output == "STATO,3201,ATTENDI_ARRESTO->FERMO\n"
+                          "STATO,3203,FERMO->PRE_GONFIAGGIO\n");
+}
+
+static void serial_logs_need_space_for_the_whole_line() {
+  reset(); ready(); Serial.output.clear();
+  const std::string expected = "STATO,3000,ATTENDI_FRONTE->MOTOR_ON\n";
+  Serial.txSpace = int(expected.size()) - 1;
+  edge(3000);
+  assert(Serial.output.empty() && stato == MOTOR_ON && hardware::levels[3] == HIGH);
+  tick(3200);
+  assert(Serial.output.empty() && hardware::levels[3] == LOW);
+
+  reset(); ready(); Serial.output.clear();
+  Serial.txSpace = int(expected.size());
+  edge(3000);
+  assert(Serial.output == expected);
 }
 
 int main() {
@@ -290,5 +328,7 @@ int main() {
   millis_rollover();
   encoder_counter_rollover();
   congested_serial_does_not_extend_motor_on();
-  std::cout << "15 gruppi di test PASS (simulazione, non validazione del prototipo)\n";
+  serial_logs_each_change_once_and_keeps_periodic_status();
+  serial_logs_need_space_for_the_whole_line();
+  std::cout << "17 gruppi di test PASS (simulazione, non validazione del prototipo)\n";
 }

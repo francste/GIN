@@ -52,10 +52,33 @@ uint32_t leggiEncoder() {
   return totale;
 }
 
+const char* nomeStato(Stato valore) {
+  switch (valore) {
+    case PRE_GONFIAGGIO: return "PRE_GONFIAGGIO";
+    case ATTENDI_ARRESTO: return "ATTENDI_ARRESTO";
+    case ATTENDI_FRONTE: return "ATTENDI_FRONTE";
+    case MOTOR_ON: return "MOTOR_ON";
+    case FERMO: return "FERMO";
+  }
+  return "?";
+}
+
+void stampaCambioStato(Stato precedente, Stato nuovoStato) {
+  char riga[64];
+  const int lunghezza = snprintf(riga, sizeof(riga), "STATO,%lu,%s->%s\n",
+                                (unsigned long)millis(), nomeStato(precedente),
+                                nomeStato(nuovoStato));
+  // Nessuna attesa per la UART: stampa solo se entra l'intera riga.
+  if (lunghezza > 0 && lunghezza < int(sizeof(riga)) &&
+      Serial.availableForWrite() >= lunghezza) Serial.print(riga);
+}
+
 void cambiaStato(Stato nuovoStato) {
   if (nuovoStato == stato) return;
+  const Stato precedente = stato;
   stato = nuovoStato;
   ingressoStato = true;
+  stampaCambioStato(precedente, nuovoStato);
 }
 
 void correggiDurata(uint32_t now, uint32_t totale) {

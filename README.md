@@ -143,7 +143,20 @@ Monitor seriale a **115200 baud**, con o senza terminazione di riga:
 campioni della precedente. I timer degli stati usano `millis()` e il filtro
 encoder usa `micros()`, senza `delay()`.
 
-Il log, una riga al secondo se il buffer ha spazio, e':
+A ogni cambio di stato viene stampato il tempo in millisecondi dall'avvio
+e il nome dello stato precedente e di quello nuovo, incluso il pregonfiaggio
+iniziale e i comandi stop/riavvio. Esempio:
+
+```text
+STATO,0,FERMO->PRE_GONFIAGGIO
+STATO,2500,PRE_GONFIAGGIO->ATTENDI_ARRESTO
+STATO,2800,ATTENDI_ARRESTO->ATTENDI_FRONTE
+STATO,3000,ATTENDI_FRONTE->MOTOR_ON
+STATO,3200,MOTOR_ON->ATTENDI_ARRESTO
+```
+
+Una richiesta dello stato gia' attivo non genera un nuovo messaggio.
+Il log periodico, una riga al secondo se il buffer ha spazio, e':
 
 ```text
 S,stato,P,durata_motor_on_ms,N,fronti_periodo,T,periodo_ms
@@ -153,6 +166,10 @@ Stati: 0=pregonfiaggio, 1=attesa arresto, 2=attesa fronte,
 3=motor-on, 4=fermo. `N` e `T` descrivono lo stesso ultimo intervallo completato
 tra due motor-on; valgono 0 fino al secondo motor-on. `P` e' la durata corretta
 dell'impulso di controllo, anche durante il pregonfiaggio da 2500 ms.
+
+Entrambi i log vengono inviati solo se l'intera riga entra nel buffer UART;
+con spazio insufficiente la riga viene saltata, senza accodarla o aspettare.
+Le stampe avvengono nel codice principale, fuori dall'ISR dell'encoder.
 
 ## Lettura atomica e verifiche
 
@@ -180,11 +197,12 @@ AVR GCC Debian 14.2.0, diverso da quello del pacchetto Arduino standard.
 Gli indici remoti e i tool di discovery non disponibili non impediscono
 la compilazione con il core locale. Il caricamento USB non e' verificato.
 
-I test verificano 15 gruppi: avvio/pin, copia debug e holdoff (inclusa la
+I test verificano 17 gruppi: avvio/pin, copia debug e holdoff (inclusa la
 soglia esatta di 2 ms), rollover di `micros()`, ONCE, attesa fissa dopo il
 pregonfiaggio e dopo ogni impulso, correzione e conteggio, timestamp motor-on,
 moto continuo, minimo di 50 ms, massimo di 400 ms, stop/riavvio, rollover
-di `millis()` e del contatore, seriale congestionata.
+di `millis()` e del contatore, seriale congestionata, log delle transizioni
+e periodico, spazio UART sufficiente per l'intera riga.
 
 ```sh
 set -e
