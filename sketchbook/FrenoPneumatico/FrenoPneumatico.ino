@@ -1,223 +1,162 @@
 #include <Arduino.h>
 #include <util/atomic.h>
-#include <stdlib.h>
-#include "Controller.h"
+#include <stdio.h>
 
+// Parametri della prima prova: modificare questi valori per tarare il sistema.
 constexpr uint8_t MOTOR_PIN = 3;
-constexpr uint8_t ENCODER_PIN = A0; // D14 sul Nano Every.
-constexpr uint32_t MIN_EDGE_US = 0; // Filtro disattivo: conta anche impulsi stretti.
-constexpr bool ENCODER_PULLUP = true; // false se l'ingresso ha già un pilotaggio.
+constexpr uint8_t ENCODER_PIN = A0;            // D14 sul Nano Every.
+constexpr uint32_t PRECARICA_MS = 2500;
+constexpr uint16_t IMPULSO_INIZIALE_MS = 200;
+constexpr uint16_t PASSO_MS = 20;
+constexpr uint16_t IMPULSO_MINIMO_MS = 20;
+constexpr uint32_t MS_PER_FRONTE = 600;
+constexpr uint32_t TIMEOUT_BLOCCO_MS = 300;    // Silenzio encoder per blocco presunto.
 
-// Print normalmente aspetta quando il buffer UART è pieno. Qui i log vengono
-// accodati e trasmessi solo se c'è spazio, senza ritardare lo stop della pompa.
-class NonBlockingLog : public Print {
- public:
-  using Print::write;
-  size_t write(uint8_t value) override {
-    const uint16_t next = (tail + 1) % sizeof(buffer);
-    if (next == head) ++dropped;
-    else { buffer[tail] = value; tail = next; }
-    return 1;
-  }
-  void drain() {
-    for (uint8_t n = 0; n < 32 && head != tail && Serial.availableForWrite() > 0; ++n) {
-      Serial.write(buffer[head]);
-      head = (head + 1) % sizeof(buffer);
-    }
-    if (head == tail && dropped != 0) {
-      const uint32_t lost = dropped;
-      dropped = 0;
-      print(F("TX_DROPPED,")); println(lost);
-    }
-  }
- private:
-  uint8_t buffer[768];
-  uint16_t head = 0;
-  uint16_t tail = 0;
-  uint32_t dropped = 0;
+enum Stato { PRECARICA, ATTENDI_FRONTE, IMPULSO, ATTENDI_BLOCCO, FERMO };
+Stato stato = FERMO;
+uint16_t durataImpulsoMs = IMPULSO_INIZIALE_MS;
+uint32_t inizioAccensioneMs = 0;
+uint32_t inizioScattoMs = 0;
+uint32_t ultimoFronteScattoMs = 0;
+uint32_t frontiScatto = 0;
+uint32_t ultimoPeriodoMs = 0;
+uint32_t ultimoLogMs = 0;
+
+// L'interrupt registra tutti i fronti; il loop li ritira insieme.
+volatile uint32_t frontiPendenti = 0;
+volatile uint32_t primoFronteMs = 0;
+volatile uint32_t ultimoFronteMs = 0;
+
+struct LetturaEncoder {
+  uint32_t fronti;
+  uint32_t primoMs;
+  uint32_t ultimoMs;
 };
 
-NonBlockingLog logPort;
-BrakeController brake;
-volatile uint32_t encoderTotal = 0;
-volatile uint32_t encoderLastMs = 0;
-volatile uint32_t encoderMeanPeriodUs = 0;
-volatile uint32_t encoderPreviousUs = 0;
-volatile uint32_t encoderOlderUs = 0;
-volatile uint8_t encoderHistory = 0;
-
 void encoderISR() {
-  const uint32_t now = micros();
-  if (encoderHistory != 0 && uint32_t(now - encoderPreviousUs) < MIN_EDGE_US) return;
-  if (encoderHistory >= 2) encoderMeanPeriodUs = uint32_t(now - encoderOlderUs) / 2;
-  encoderOlderUs = encoderPreviousUs;
-  encoderPreviousUs = now;
-  if (encoderHistory < 3) ++encoderHistory;
-  encoderLastMs = millis();
-  ++encoderTotal;
-}
-
-EncoderReading readEncoder() {
-  EncoderReading result;
-  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    result.total = encoderTotal;
-    result.lastEdgeMs = encoderLastMs;
-    result.meanPeriodUs = encoderMeanPeriodUs;
-  }
-  return result;
-}
-
-void printHelp() {
-  logPort.println(F("a=avvia, s=arresta, ?=aiuto; comandi terminati da invio"));
-  logPort.println(F("Solo da fermo: t 600 (ms/fronte), d 800 (attesa ms),"));
-  logPort.println(F("q 1800 (silenzio ms), b 25 (bias ms), p 50 (impulso manuale)"));
-  logPort.println(F("PUMP,t_ms,durata_ms,richiesta_ms,bias_ms"));
-  logPort.println(F("CYCLE,t_ms,fronti,ciclo_ms,fronti_target,errore_filtrato,bias_ms,min_intervallo_us"));
-  logPort.println(F("RATE,t_ms,fronti_campione,campione_ms,errore_filtrato,bias_ms"));
-  logPort.println(F("STATUS,t_ms,armato,pompa,fronti_scatto,pompa_totale_ms,bias_ms,fault,fronti_totali,last_fronte_ms"));
-}
-
-void printPump(uint32_t now) {
-  logPort.print(F("PUMP,")); logPort.print(now);
-  logPort.print(','); logPort.print(brake.pulseMs);
-  logPort.print(','); logPort.print(brake.requestedMs, 2);
-  logPort.print(','); logPort.println(brake.biasMs, 2);
-}
-
-void command(char *line) {
   const uint32_t now = millis();
-  if (line[0] == 's' && line[1] == '\0') {
-    brake.stop(now);
-    digitalWrite(MOTOR_PIN, LOW);
-    logPort.println(F("STOP"));
-    return;
-  }
-  if (line[0] == '?' && line[1] == '\0') { printHelp(); return; }
-  if (line[0] == 'a' && line[1] == '\0') {
-    if (brake.armed || brake.pumping) {
-      logPort.println(F("ERR: inviare s prima di iniziare un nuovo test"));
-      return;
-    }
-    brake.arm(now, readEncoder().total);
-    digitalWrite(MOTOR_PIN, LOW);
-    logPort.println(F("ARMED"));
-    return;
-  }
-  if (brake.armed || brake.pumping) {
-    logPort.println(F("ERR: inviare s prima di cambiare parametri"));
-    return;
-  }
-  char *end;
-  const long value = strtol(line + 1, &end, 10);
-  while (*end == ' ') ++end;
-  if (end == line + 1 || *end != '\0') {
-    logPort.println(F("ERR: comando o numero non valido"));
-    return;
-  }
-  bool accepted = false;
-  switch (line[0]) {
-    case 't':
-      if (value >= 50 && value <= 5000 && brake.config.quietMs > uint32_t(value)) {
-        brake.config.targetEdgeMs = value; accepted = true;
-      }
-      break;
-    case 'd':
-      if (value >= 50 && value <= 10000) {
-        brake.config.responseWaitMs = value; accepted = true;
-      }
-      break;
-    case 'q':
-      if (value > long(brake.config.targetEdgeMs) && value <= 30000) {
-        brake.config.quietMs = value; accepted = true;
-      }
-      break;
-    case 'b':
-      if (value >= -long(brake.config.proportionalMs) && value <= brake.config.maxPulseMs) {
-        brake.biasMs = value; accepted = true;
-      }
-      break;
-    case 'p':
-      if (value >= brake.config.minPulseMs && value <= brake.config.maxPulseMs) {
-        accepted = brake.manualPulse(now, uint16_t(value));
-        digitalWrite(MOTOR_PIN, brake.pumping ? HIGH : LOW);
-        if (accepted) printPump(now);
-      }
-      break;
-  }
-  logPort.println(accepted ? F("OK") : F("ERR: valore fuori limite, attesa attiva o fault"));
+  if (frontiPendenti == 0) primoFronteMs = now;
+  ultimoFronteMs = now;
+  ++frontiPendenti;
 }
 
-void readCommands() {
-  static char line[32];
-  static uint8_t length = 0;
-  static bool overflow = false;
-  // Lettura limitata: lo spegnimento della pompa deve essere servito spesso.
-  for (uint8_t n = 0; n < 16 && Serial.available(); ++n) {
-    const char c = char(Serial.read());
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (overflow) logPort.println(F("ERR: comando troppo lungo"));
-      else if (length) { line[length] = '\0'; command(line); }
-      length = 0;
-      overflow = false;
-    } else if (length < sizeof(line) - 1) line[length++] = c;
-    else overflow = true;
+LetturaEncoder leggiEncoder() {
+  LetturaEncoder lettura;
+  // Su AVR una lettura a 32 bit richiede piu' istruzioni: proteggiamo la copia.
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    lettura.fronti = frontiPendenti;
+    lettura.primoMs = primoFronteMs;
+    lettura.ultimoMs = ultimoFronteMs;
+    frontiPendenti = 0;
   }
+  return lettura;
+}
+
+void avvia(uint32_t now) {
+  durataImpulsoMs = IMPULSO_INIZIALE_MS;
+  frontiScatto = 0;
+  ultimoPeriodoMs = 0;
+  inizioAccensioneMs = now;
+  stato = PRECARICA;
+  digitalWrite(MOTOR_PIN, HIGH);
+}
+
+void aggiornaFreno(uint32_t now, const LetturaEncoder &encoder) {
+  switch (stato) {
+    case PRECARICA:
+      // Una sola precarica; i fronti di questa fase non fanno parte dei cicli.
+      if (uint32_t(now - inizioAccensioneMs) >= PRECARICA_MS) {
+        digitalWrite(MOTOR_PIN, LOW);
+        stato = ATTENDI_FRONTE;
+      }
+      break;
+
+    case ATTENDI_FRONTE:
+      if (encoder.fronti == 0) break;
+
+      // Dal secondo scatto confrontiamo primo fronte -> primo fronte.
+      // n include il primo fronte e tutti quelli prima del blocco precedente.
+      if (frontiScatto != 0) {
+        ultimoPeriodoMs = uint32_t(encoder.primoMs - inizioScattoMs);
+        const uint64_t tempoObiettivoMs = uint64_t(frontiScatto) * MS_PER_FRONTE;
+        if (ultimoPeriodoMs > tempoObiettivoMs) {
+          durataImpulsoMs = durataImpulsoMs > IMPULSO_MINIMO_MS + PASSO_MS
+              ? durataImpulsoMs - PASSO_MS : IMPULSO_MINIMO_MS;
+        }
+      }
+
+      inizioScattoMs = encoder.primoMs;
+      ultimoFronteScattoMs = encoder.ultimoMs;
+      frontiScatto = encoder.fronti;
+      inizioAccensioneMs = now;
+      // Se si sceglie un minimo di 0 ms, a zero osserviamo senza accendere.
+      stato = durataImpulsoMs != 0 ? IMPULSO : ATTENDI_BLOCCO;
+      digitalWrite(MOTOR_PIN, durataImpulsoMs != 0 ? HIGH : LOW);
+      break;
+
+    case IMPULSO:
+    case ATTENDI_BLOCCO:
+      // I nuovi fronti vengono contati anche a pompa accesa e durante l'attesa.
+      // Non comandano altri impulsi e non prolungano quello gia' in corso.
+      frontiScatto += encoder.fronti;
+      if (encoder.fronti != 0) ultimoFronteScattoMs = encoder.ultimoMs;
+
+      if (stato == IMPULSO) {
+        if (uint32_t(now - inizioAccensioneMs) >= durataImpulsoMs) {
+          digitalWrite(MOTOR_PIN, LOW);
+          stato = ATTENDI_BLOCCO;
+        }
+      } else if (uint32_t(now - ultimoFronteScattoMs) >= TIMEOUT_BLOCCO_MS) {
+        // Blocco presunto: conserviamo n per il prossimo primo fronte.
+        stato = ATTENDI_FRONTE;
+      }
+      break;
+
+    case FERMO:
+      break;
+  }
+}
+
+void leggiComandi() {
+  // Bastano s=stop e a=nuova prova. La lettura limitata mantiene rapido il loop.
+  for (uint8_t i = 0; i < 8 && Serial.available() > 0; ++i) {
+    const char comando = char(Serial.read());
+    if (comando == 's') {
+      digitalWrite(MOTOR_PIN, LOW);
+      stato = FERMO;
+    } else if (comando == 'a' && stato == FERMO) {
+      avvia(millis());
+    }
+  }
+}
+
+void stampaStato(uint32_t now) {
+  // Una riga breve al secondo, solo se entra nel buffer: la seriale non attende.
+  char riga[60];
+  if (uint32_t(now - ultimoLogMs) < 1000 || Serial.availableForWrite() < 60) return;
+  ultimoLogMs = now;
+  snprintf(riga, sizeof(riga), "S,%u,P,%u,N,%lu,T,%lu\n", unsigned(stato),
+           unsigned(durataImpulsoMs), (unsigned long)frontiScatto,
+           (unsigned long)ultimoPeriodoMs);
+  Serial.print(riga);
 }
 
 void setup() {
-  // Precarica i livelli prima di commutare i pin come uscite.
   digitalWrite(MOTOR_PIN, LOW); pinMode(MOTOR_PIN, OUTPUT);
   digitalWrite(11, HIGH); pinMode(11, OUTPUT);
   digitalWrite(6, HIGH); pinMode(6, OUTPUT);
   digitalWrite(4, LOW); pinMode(4, OUTPUT);
-  pinMode(ENCODER_PIN, ENCODER_PULLUP ? INPUT_PULLUP : INPUT);
+  digitalWrite(ENCODER_PIN, LOW);
+  pinMode(ENCODER_PIN, INPUT);                 // Encoder SENZA pull-up interno.
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, CHANGE);
   Serial.begin(115200);
-  printHelp(); // Nessuna attesa di connessione seriale e motore spento al boot.
+  avvia(millis());                            // Precarica automatica all'avvio.
 }
 
 void loop() {
-  const uint32_t now = millis();
-  const EncoderReading encoder = readEncoder();
-  const uint8_t events = brake.update(now, encoder);
-  digitalWrite(MOTOR_PIN, brake.pumping ? HIGH : LOW);
-  if (events & BrakeController::PUMP_ON) printPump(now);
-  if (events & BrakeController::PUMP_OFF) {
-    logPort.print(F("OFF,")); logPort.println(now);
-  }
-  if (events & BrakeController::CYCLE) {
-    logPort.print(F("CYCLE,")); logPort.print(now);
-    logPort.print(','); logPort.print(brake.cycleEdges);
-    logPort.print(','); logPort.print(brake.cycleMs);
-    logPort.print(','); logPort.print(float(brake.cycleMs) / brake.config.targetEdgeMs, 2);
-    logPort.print(','); logPort.print(brake.filteredError, 3);
-    logPort.print(','); logPort.print(brake.biasMs, 2);
-    logPort.print(','); logPort.println(brake.minPeriodUs);
-  }
-  if (events & BrakeController::RATE) {
-    logPort.print(F("RATE,")); logPort.print(now);
-    logPort.print(','); logPort.print(brake.sampleEdges);
-    logPort.print(','); logPort.print(brake.sampleMs);
-    logPort.print(','); logPort.print(brake.filteredError, 3);
-    logPort.print(','); logPort.println(brake.biasMs, 2);
-  }
-  if (events & BrakeController::FAULT) {
-    logPort.print(F("FAULT,")); logPort.println(uint8_t(brake.fault));
-  }
-  readCommands();
-  logPort.drain();
-  static uint32_t lastStatusMs = 0;
-  if (uint32_t(now - lastStatusMs) >= 1000) {
-    lastStatusMs = now;
-    logPort.print(F("STATUS,")); logPort.print(now);
-    logPort.print(','); logPort.print(brake.armed);
-    logPort.print(','); logPort.print(brake.pumping);
-    logPort.print(','); logPort.print(brake.burstEdges);
-    logPort.print(','); logPort.print(brake.sessionOnMs);
-    logPort.print(','); logPort.print(brake.biasMs, 2);
-    logPort.print(','); logPort.print(uint8_t(brake.fault));
-    logPort.print(','); logPort.print(encoder.total);
-    logPort.print(','); logPort.println(encoder.lastEdgeMs);
-  }
+  const LetturaEncoder encoder = leggiEncoder();
+  const uint32_t now = millis();              // Dopo la copia: mai prima dei fronti.
+  aggiornaFreno(now, encoder);
+  leggiComandi();
+  stampaStato(now);
 }
