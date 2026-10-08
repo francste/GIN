@@ -10,6 +10,64 @@ Un impulso completo alto/basso genera due conteggi; il target equivale quindi
 a un impulso completo ogni 1200 ms. Il filtro temporale dei fronti è disattivato
 di default, per contare anche gli impulsi stretti.
 
+## Struttura e uso locale
+
+```text
+GIN/
+├── README.md
+├── sketchbook/
+│   └── FrenoPneumatico/
+│       ├── FrenoPneumatico.ino
+│       └── Controller.h
+└── tests/
+    ├── controller_test.cpp
+    └── mock/
+        ├── Arduino.h
+        └── util/
+            └── atomic.h
+```
+
+Il repository locale può essere la cartella `GIN`. In Arduino IDE impostare
+la **Posizione sketchbook** nelle preferenze alla cartella `GIN/sketchbook`
+del proprio computer, oppure aprire direttamente
+`sketchbook/FrenoPneumatico/FrenoPneumatico.ino`.
+Arduino richiede che la cartella dello sketch e il file `.ino` principale
+abbiano lo stesso nome: qui entrambi si chiamano `FrenoPneumatico`.
+
+Tutti i sorgenti del firmware sono nella stessa cartella dello sketch.
+`FrenoPneumatico.ino` contiene pin, encoder, seriale e funzioni `setup`/`loop`;
+`Controller.h` contiene la regolazione e i suoi parametri. Mantenere due file
+permette di leggere e provare la regolazione separatamente dall'hardware.
+È possibile riunirli in un `.ino`, ma non è necessario per compilare con
+Arduino IDE. Non servono librerie locali aggiuntive in `sketchbook/libraries`.
+
+`tests/` è riservata alla simulazione sul PC e non va copiata nella cartella
+dello sketch. I suoi file `Arduino.h` e `util/atomic.h` sostituiscono le API
+hardware soltanto quando i test vengono compilati con `-I tests/mock`.
+
+### A cosa serve `util/atomic.h`
+
+Nel firmware, `<util/atomic.h>` è fornito dalla toolchain AVR del pacchetto
+Arduino megaAVR Boards. L'interrupt dell'encoder aggiorna variabili a 32 bit;
+su questo microcontrollore a 8 bit, leggerle richiede più istruzioni.
+`volatile` da solo non impedisce che un interrupt intervenga durante la lettura.
+In `readEncoder()`, `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)` sospende gli interrupt
+per copiare insieme conteggio, ultimo istante e periodo medio, poi ripristina
+lo stato precedente degli interrupt.
+
+Il file `tests/mock/util/atomic.h` contiene una versione per i test: il suo
+`for` esegue il blocco una sola volta e non disabilita interrupt. Questo è
+adeguato alla simulazione sequenziale, ma non verifica la concorrenza reale
+tra interrupt e `loop()`. Non usare questo file sul Nano Every: la compilazione
+Arduino deve trovare la versione AVR originale.
+
+Dopo aver installato Arduino megaAVR Boards, dalla radice del repository
+si può compilare anche con Arduino CLI:
+
+```sh
+arduino-cli compile --fqbn arduino:megaavr:nona4809:mode=off sketchbook/FrenoPneumatico
+```
+
 ## Strategia
 
 Una regolazione che reagisce ripetutamente a ogni fronte durante il ritardo
@@ -82,7 +140,7 @@ alimentato direttamente dal GPIO. Encoder e scheda devono avere massa
 comune e livelli compatibili con il Nano Every. Se l'encoder ha già un
 pilotaggio adeguato, impostare `ENCODER_PULLUP = false`.
 
-Aprire `sketches/FrenoPneumatico/FrenoPneumatico.ino` nell'IDE Arduino,
+Aprire `sketchbook/FrenoPneumatico/FrenoPneumatico.ino` nell'IDE Arduino,
 mantenendo `Controller.h` nella stessa cartella. Installare **Arduino megaAVR
 Boards**, scegliere **Arduino Nano Every**, e scegliere **Registers emulation:
 None (ATMEGA4809)**. Non selezionare il Nano classico ATmega328P.
@@ -198,6 +256,11 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
   -o /tmp/gin-tests/controller_test
 /tmp/gin-tests/controller_test
 ```
+
+Se il runtime cloud segnala che LeakSanitizer non può funzionare sotto
+`ptrace`, eseguire il binario con `ASAN_OPTIONS=detect_leaks=0`.
+AddressSanitizer e UndefinedBehaviorSanitizer rimangono attivi; è disabilitata
+soltanto la ricerca delle perdite di memoria.
 
 Queste verifiche riguardano firmware e temporizzazione simulata. Il ritardo
 pneumatico, l'attrito e la convergenza reale della velocità restano da misurare
