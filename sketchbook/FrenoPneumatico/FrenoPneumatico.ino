@@ -31,7 +31,6 @@ uint32_t precedenteMotorOnMs = 0;
 uint32_t totaleAlMotorOn = 0;
 uint32_t ultimoPeriodoMs = 0;
 uint32_t frontiPeriodo = 0;
-uint32_t ultimoLogMs = 0;
 
 void encoderISR() {
   // Copia il livello grezzo: sul debug si vedono anche i rimbalzi scartati.
@@ -52,22 +51,12 @@ uint32_t leggiEncoder() {
   return totale;
 }
 
-const char* nomeStato(Stato valore) {
-  switch (valore) {
-    case PRE_GONFIAGGIO: return "PRE_GONFIAGGIO";
-    case ATTENDI_ARRESTO: return "ATTENDI_ARRESTO";
-    case ATTENDI_FRONTE: return "ATTENDI_FRONTE";
-    case MOTOR_ON: return "MOTOR_ON";
-    case FERMO: return "FERMO";
-  }
-  return "?";
-}
-
-void stampaCambioStato(Stato precedente, Stato nuovoStato) {
+void stampaImpulso(int16_t correzioneMs) {
   char riga[64];
-  const int lunghezza = snprintf(riga, sizeof(riga), "STATO,%lu,%s->%s\n",
-                                (unsigned long)millis(), nomeStato(precedente),
-                                nomeStato(nuovoStato));
+  const int lunghezza = snprintf(riga, sizeof(riga),
+                                "Impulso %u ms, fronti %lu, correzione %+d ms\n",
+                                unsigned(durataMotorOnMs),
+                                (unsigned long)frontiPeriodo, int(correzioneMs));
   // Nessuna attesa per la UART: stampa solo se entra l'intera riga.
   if (lunghezza > 0 && lunghezza < int(sizeof(riga)) &&
       Serial.availableForWrite() >= lunghezza) Serial.print(riga);
@@ -75,10 +64,8 @@ void stampaCambioStato(Stato precedente, Stato nuovoStato) {
 
 void cambiaStato(Stato nuovoStato) {
   if (nuovoStato == stato) return;
-  const Stato precedente = stato;
   stato = nuovoStato;
   ingressoStato = true;
-  stampaCambioStato(precedente, nuovoStato);
 }
 
 void correggiDurata(uint32_t now, uint32_t totale) {
@@ -152,9 +139,12 @@ void aggiornaFreno(uint32_t now, uint32_t totale) {
 
       case MOTOR_ON:
         if (once) {                            // ONCE: correggi e accendi una volta.
+          const uint16_t durataPrecedenteMs = durataMotorOnMs;
           correggiDurata(now, totale);
           inizioStatoMs = now;
           digitalWrite(MOTOR_PIN, HIGH);
+          // Mostra la correzione effettiva, inclusi i limiti di 50 e 400 ms.
+          stampaImpulso(int16_t(durataMotorOnMs) - int16_t(durataPrecedenteMs));
         }
         // ALWAYS: i fronti si contano, senza riavviare il timer del motore.
         nuovoFronte = false;
@@ -183,17 +173,6 @@ void leggiComandi() {
   }
 }
 
-void stampaStato(uint32_t now) {
-  // Una riga al secondo solo se entra nel buffer, senza aspettare la seriale.
-  char riga[60];
-  if (uint32_t(now - ultimoLogMs) < 1000 || Serial.availableForWrite() < 60) return;
-  ultimoLogMs = now;
-  snprintf(riga, sizeof(riga), "S,%u,P,%u,N,%lu,T,%lu\n", unsigned(stato),
-           unsigned(durataMotorOnMs), (unsigned long)frontiPeriodo,
-           (unsigned long)ultimoPeriodoMs);
-  Serial.print(riga);
-}
-
 void setup() {
   // Ingressi fisici fuori dalla mappatura Arduino: buffer attivo, senza pull-up o interrupt.
   PORTD.DIRCLR = PIN6_bm; PORTD.PIN6CTRL = 0;  // PD6.
@@ -214,6 +193,7 @@ void setup() {
   digitalWrite(DEBUG_PIN, digitalRead(ENCODER_PIN));
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, CHANGE);
   Serial.begin(115200);
+  Serial.println("Avvio freno");
   cambiaStato(PRE_GONFIAGGIO);
   const uint32_t totale = leggiEncoder();
   aggiornaFreno(millis(), totale);             // Esegue subito il once iniziale.
@@ -224,5 +204,4 @@ void loop() {
   const uint32_t totale = leggiEncoder();
   const uint32_t now = millis();
   aggiornaFreno(now, totale);
-  stampaStato(now);
 }

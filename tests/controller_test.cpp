@@ -36,7 +36,7 @@ static void reset(uint64_t startMs = 0) {
   stato = FERMO; ingressoStato = true;
   encoderTotale = totaleLetto = 0;
   ultimoFronteValidoUs = 0; fronteValidoRicevuto = false;
-  precedenteMotorOnMs = totaleAlMotorOn = ultimoLogMs = 0;
+  precedenteMotorOnMs = totaleAlMotorOn = 0;
   at(startMs); setup();
 }
 
@@ -157,20 +157,24 @@ static void fixed_wait_ignores_edges_but_keeps_them_in_correction() {
 }
 
 static void correction_uses_same_time_and_counter_window() {
-  three_edges_between_motor_starts(); edge(5400);
+  three_edges_between_motor_starts(); Serial.output.clear(); edge(5400);
   assert(ultimoPeriodoMs == 2400 && frontiPeriodo == 4 && durataMotorOnMs == 200);
+  assert(Serial.output == "Impulso 200 ms, fronti 4, correzione +0 ms\n");
   // Il fronte che avvia il nuovo motor-on chiude il campione precedente.
-  tick(5600); tick(5900); edge(6001);
+  tick(5600); tick(5900); Serial.output.clear(); edge(6001);
   assert(ultimoPeriodoMs == 601 && frontiPeriodo == 1 && durataMotorOnMs == 180);
+  assert(Serial.output == "Impulso 180 ms, fronti 1, correzione -20 ms\n");
   const int writes = hardware::writes[3];
   tick(6002); tick(6100); tick(6180);
   assert(durataMotorOnMs == 180 && hardware::writes[3] == writes);
   tick(6181); assert(hardware::levels[3] == LOW);
 
-  three_edges_between_motor_starts(); edge(5401);
+  three_edges_between_motor_starts(); Serial.output.clear(); edge(5401);
   assert(ultimoPeriodoMs == 2401 && frontiPeriodo == 4 && durataMotorOnMs == 180);
-  three_edges_between_motor_starts(); edge(4000);
+  assert(Serial.output == "Impulso 180 ms, fronti 4, correzione -20 ms\n");
+  three_edges_between_motor_starts(); Serial.output.clear(); edge(4000);
   assert(ultimoPeriodoMs == 1000 && frontiPeriodo == 4 && durataMotorOnMs == 220);
+  assert(Serial.output == "Impulso 220 ms, fronti 4, correzione +20 ms\n");
 }
 
 static void delayed_loop_measures_actual_motor_on_time() {
@@ -209,8 +213,11 @@ static void maximum_motor_on_duration() {
                                360, 380, 400, 400, 400, 400, 400};
   for (uint64_t cycle = 0; cycle < 15; ++cycle) {
     const uint64_t start = 3000 + cycle * 1000;
+    Serial.output.clear();
     edge(start);
     assert(durataMotorOnMs == expected[cycle]);
+    if (cycle >= 11)
+      assert(Serial.output == "Impulso 400 ms, fronti 3, correzione +0 ms\n");
     edge(start + 50); edge(start + 100);
     tick(start + expected[cycle]);
     assert(hardware::levels[3] == LOW);
@@ -225,8 +232,13 @@ static void minimum_motor_on_duration() {
                                50, 50, 50, 50, 50, 50, 50};
   for (uint64_t cycle = 0; cycle < 15; ++cycle) {
     const uint64_t start = 3000 + cycle * 1000;
+    Serial.output.clear();
     edge(start);
     assert(durataMotorOnMs == expected[cycle] && hardware::levels[3] == HIGH);
+    if (cycle == 8)
+      assert(Serial.output == "Impulso 50 ms, fronti 1, correzione -10 ms\n");
+    if (cycle >= 9)
+      assert(Serial.output == "Impulso 50 ms, fronti 1, correzione +0 ms\n");
     tick(start + expected[cycle]);
     assert(hardware::levels[3] == LOW);
     tick(start + expected[cycle] + 300);
@@ -279,32 +291,29 @@ static void congested_serial_does_not_extend_motor_on() {
   assert(Serial.output.empty());
 }
 
-static void serial_logs_each_change_once_and_keeps_periodic_status() {
+static void serial_logs_startup_once_and_each_motor_pulse_once() {
   reset();
-  assert(Serial.output == "STATO,0,FERMO->PRE_GONFIAGGIO\n");
-  Serial.output.clear();
-  tick(999); assert(Serial.output.empty());
-  tick(1000); tick(1001);
-  assert(Serial.output == "S,0,P,200,N,0,T,0\n");
+  assert(Serial.output == "Avvio freno\n");
+  tick(999); tick(1000); tick(1001); tick(2500); tick(2800);
+  assert(Serial.output == "Avvio freno\n");
 
-  Serial.output.clear(); tick(2500);
-  assert(Serial.output == "STATO,2500,PRE_GONFIAGGIO->ATTENDI_ARRESTO\n"
-                          "S,1,P,200,N,0,T,0\n");
-  Serial.output.clear(); tick(2800); edge(3000); tick(3001); edge(3100); tick(3200);
-  assert(Serial.output == "STATO,2800,ATTENDI_ARRESTO->ATTENDI_FRONTE\n"
-                          "STATO,3000,ATTENDI_FRONTE->MOTOR_ON\n"
-                          "STATO,3200,MOTOR_ON->ATTENDI_ARRESTO\n");
+  Serial.output.clear(); edge(3000);
+  assert(Serial.output == "Impulso 200 ms, fronti 0, correzione +0 ms\n");
+  tick(3001); edge(3100); tick(3200); tick(3500);
+  assert(Serial.output == "Impulso 200 ms, fronti 0, correzione +0 ms\n");
 
-  Serial.output.clear(); Serial.receive("s"); tick(3201);
-  Serial.receive("s"); tick(3202);
-  Serial.receive("a"); tick(3203);
-  assert(Serial.output == "STATO,3201,ATTENDI_ARRESTO->FERMO\n"
-                          "STATO,3203,FERMO->PRE_GONFIAGGIO\n");
+  edge(4301); tick(4481); tick(4781);
+  Serial.receive("s"); tick(4782);
+  Serial.receive("a"); tick(4783);
+  tick(7283); tick(7583); edge(7600);
+  assert(Serial.output == "Impulso 200 ms, fronti 0, correzione +0 ms\n"
+                          "Impulso 180 ms, fronti 2, correzione -20 ms\n"
+                          "Impulso 200 ms, fronti 0, correzione +0 ms\n");
 }
 
 static void serial_logs_need_space_for_the_whole_line() {
   reset(); ready(); Serial.output.clear();
-  const std::string expected = "STATO,3000,ATTENDI_FRONTE->MOTOR_ON\n";
+  const std::string expected = "Impulso 200 ms, fronti 0, correzione +0 ms\n";
   Serial.txSpace = int(expected.size()) - 1;
   edge(3000);
   assert(Serial.output.empty() && stato == MOTOR_ON && hardware::levels[3] == HIGH);
@@ -333,7 +342,7 @@ int main() {
   millis_rollover();
   encoder_counter_rollover();
   congested_serial_does_not_extend_motor_on();
-  serial_logs_each_change_once_and_keeps_periodic_status();
+  serial_logs_startup_once_and_each_motor_pulse_once();
   serial_logs_need_space_for_the_whole_line();
   std::cout << "17 gruppi di test PASS (simulazione, non validazione del prototipo)\n";
 }
