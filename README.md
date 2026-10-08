@@ -1,41 +1,89 @@
-# Freno pneumatico — prova semplice su Arduino Nano Every
+# Freno pneumatico — macchina a stati su Arduino Nano Every
 
-Il firmware precarica la camera d'aria e, al primo fronte encoder di ogni
-scatto, accende la pompa per un solo impulso. Dopo il blocco presunto attende
-il prossimo fronte e puo' ridurre l'impulso di 20 ms.
+Tutto il firmware e' in `sketchbook/FrenoPneumatico/FrenoPneumatico.ino`.
+Ogni stato contiene una parte **ONCE**, eseguita all'ingresso, e una parte
+**ALWAYS**, eseguita a ogni loop. Il timer del motore e la correzione della
+sua durata vengono impostati solo nel ONCE di `MOTOR_ON`.
 
 ## Sequenza
 
-1. All'avvio accende la pompa per **2500 ms**, poi la spegne.
-   I fronti arrivati durante la precarica vengono ignorati.
-2. Il primo fronte dopo la precarica avvia subito un impulso di **200 ms**.
-3. Conta tutti i fronti dello scatto, compreso il primo e quelli arrivati
-   durante l'impulso. Al termine dell'impulso la pompa si spegne.
-4. Attende **300 ms senza fronti** per considerare il freno bloccato.
-   Ogni nuovo fronte prima del timeout incrementa `n` e riavvia il timeout;
-   non accende nuovamente la pompa e non prolunga l'impulso.
-5. Al primo fronte del nuovo scatto misura `T`: il tempo dal primo fronte
-   dello scatto precedente al primo del nuovo, includendo moto e pausa.
-   Se **T > n × 600 ms**, riduce l'impulso di **20 ms**, fino a un minimo
-   di **20 ms**. Con uguaglianza o tempo inferiore mantiene la durata.
-6. Il nuovo fronte e' il primo del nuovo conteggio; avvia un solo impulso
-   con la durata appena calcolata e ripete la sequenza.
+```mermaid
+stateDiagram-v2
+    [*] --> PRE_GONFIAGGIO
+    PRE_GONFIAGGIO --> ATTENDI_ARRESTO: 2500 ms
+    ATTENDI_ARRESTO --> MOTOR_ON: nuovo fronte
+    ATTENDI_ARRESTO --> ATTENDI_PRIMO_FRONTE: 300 ms senza fronti
+    ATTENDI_PRIMO_FRONTE --> MOTOR_ON: primo fronte
+    MOTOR_ON --> ATTENDI_ARRESTO: fine impulso
+```
 
-Esempio: se il primo scatto produce 4 fronti, il confronto e' con 2400 ms.
-Un nuovo primo fronte dopo 2401 ms porta l'impulso da 200 a 180 ms; dopo
-2400 ms o meno lo lascia a 200 ms. La durata puo' solo diminuire: questo
-algoritmo non la aumenta quando il moto e' troppo rapido.
+| Stato | ONCE: all'ingresso | ALWAYS: a ogni loop |
+| --- | --- | --- |
+| `PRE_GONFIAGGIO` | Ripristina la prova; accende la pompa | Dopo 2500 ms passa ad attesa arresto |
+| `ATTENDI_ARRESTO` | Spegne la pompa; avvia il timeout | Un fronte avvia un impulso; 300 ms senza fronti confermano l'arresto |
+| `ATTENDI_PRIMO_FRONTE` | Mantiene la pompa spenta | Aspetta il primo fronte dopo l'arresto |
+| `MOTOR_ON` | Corregge la durata; campiona tempo e contatore; accende la pompa | Conta i fronti senza prolungare il timer; alla scadenza torna ad attesa arresto |
+| `FERMO` | Spegne la pompa | Aspetta il comando di riavvio |
 
-Il timeout conferma un **blocco presunto dall'encoder**: non misura la pressione
-ne' uno spostamento piu' piccolo della risoluzione dell'encoder. Il valore di
-300 ms e' una scelta iniziale da verificare sul banco. Con 1800 ms, uno scatto
-con 1–3 fronti farebbe quasi sempre diminuire l'impulso per la sola attesa.
-Se non si verifica mai il timeout, il firmware continua a contare e attende
-il blocco a pompa spenta, senza aggiungere altri impulsi.
+Una transizione esegue subito il ONCE del nuovo stato, nello stesso loop.
+All'avvio il pregonfiaggio dura 2,5 secondi. Si passa poi a `ATTENDI_ARRESTO`,
+anche se non sono arrivati fronti, per osservare un intero timeout di silenzio.
 
-## Sorgente e parametri
+Ogni fronte rilevato in `ATTENDI_ARRESTO` fa entrare in `MOTOR_ON`: possono
+quindi esserci piu' impulsi prima dell'arresto. I fronti arrivati durante un
+motor-on vengono contati, ma non riavviano il timer e non accodano impulsi.
+Il primo impulso ha durata 200 ms. Alla sua scadenza la pompa si spegne e
+parte una nuova attesa di 300 ms senza fronti, misurata dallo spegnimento.
+Quando scade il timeout, il controllo aspetta il primo fronte del nuovo scatto.
 
-Tutto il firmware e' in un unico file commentato:
+Il blocco e' **presunto dal silenzio dell'encoder**. Il timeout di 300 ms e'
+una scelta iniziale da verificare sulla meccanica; non misura la pressione
+ne' uno spostamento piu' piccolo della risoluzione dell'encoder.
+
+## Correzione della durata motor-on
+
+A ogni ingresso in `MOTOR_ON` si campionano il tempo corrente e il contatore
+encoder cumulativo. Dal secondo ingresso si calcolano sullo stesso intervallo:
+
+```text
+T = tempo motor-on attuale - tempo motor-on precedente
+n = contatore attuale - contatore al motor-on precedente
+obiettivo = n * 600 ms
+
+T > obiettivo  -> durata motor-on diminuisce di 20 ms
+T < obiettivo  -> durata motor-on aumenta di 20 ms
+T = obiettivo  -> durata motor-on invariata
+```
+
+La durata resta tra **20 e 400 ms**. Questi sono limiti temporali modificabili
+nel sorgente. La correzione si esegue una volta all'ingresso di `MOTOR_ON`;
+la nuova durata viene usata subito per quell'impulso.
+
+`T` e' misurato tra gli avvii del motore, non tra i timestamp dei fronti.
+Il campione `n` include tutti i fronti successivi al campione del precedente
+motor-on, durante accensione e attesa, compreso il fronte che attiva il nuovo
+motor-on. Il fronte che aveva attivato l'accensione precedente e' gia' nel
+campione iniziale e non viene contato nuovamente. I fronti del pregonfiaggio
+non influenzano la correzione: il primo motor-on registra soltanto la base.
+
+Esempio: con 4 fronti tra due motor-on, il confronto e' con 2400 ms.
+Un periodo di 2401 ms porta la durata da 200 a 180 ms; 2399 ms la porta a
+220 ms; 2400 ms la lascia invariata. Contatore e `millis()` usano sottrazioni
+unsigned, per gestire il loro rollover.
+
+## Parametri e struttura locale
+
+I parametri sono all'inizio del `.ino`:
+
+| Parametro | Valore iniziale | Significato |
+| --- | --- | --- |
+| `PRE_GONFIAGGIO_MS` | 2500 | Accensione iniziale |
+| `TIMEOUT_ARRESTO_MS` | 300 | Silenzio dopo lo spegnimento per arresto presunto |
+| `MS_PER_FRONTE` | 600 | Tempo obiettivo per ciascun fronte |
+| `IMPULSO_INIZIALE_MS` | 200 | Primo motor-on di controllo |
+| `PASSO_MS` | 20 | Correzione della durata per intervallo |
+| `IMPULSO_MINIMO_MS` | 20 | Durata minima |
+| `IMPULSO_MASSIMO_MS` | 400 | Durata massima |
 
 ```text
 GIN/
@@ -51,23 +99,13 @@ GIN/
             └── atomic.h
 ```
 
-I parametri sono all'inizio del `.ino`:
+Usare `GIN` come repository locale. Nelle preferenze dell'IDE Arduino,
+impostare **Posizione sketchbook** su `GIN/sketchbook`, oppure aprire il `.ino`
+direttamente. La cartella dello sketch e il file principale hanno lo stesso
+nome, come richiesto da Arduino. Installare **Arduino megaAVR Boards**,
+scegliere **Arduino Nano Every** e **Registers emulation: None (ATMEGA4809)**.
 
-| Parametro | Valore iniziale | Significato |
-| --- | --- | --- |
-| `PRECARICA_MS` | 2500 | Accensione pompa all'avvio |
-| `IMPULSO_INIZIALE_MS` | 200 | Primo impulso di frenatura |
-| `PASSO_MS` | 20 | Riduzione per ciclo troppo lento |
-| `IMPULSO_MINIMO_MS` | 20 | Durata minima; impostare 0 per consentire pompa spenta |
-| `MS_PER_FRONTE` | 600 | Tempo obiettivo per ciascun fronte |
-| `TIMEOUT_BLOCCO_MS` | 300 | Assenza di fronti per blocco presunto |
-
-Il codice ha quattro stati operativi: `PRECARICA`, `ATTENDI_FRONTE`,
-`IMPULSO`, `ATTENDI_BLOCCO`, piu' lo stato manuale `FERMO`.
-La temporizzazione usa `millis()`, senza `delay()`: l'encoder e il comando
-seriale di stop vengono serviti anche durante le accensioni.
-
-## Collegamenti e IDE Arduino
+## Collegamenti e seriale
 
 | Segnale | Pin | Configurazione |
 | --- | --- | --- |
@@ -77,60 +115,39 @@ seriale di stop vengono serviti anche durante le accensioni.
 | Comando pompa | D3 | HIGH acceso, LOW spento |
 | Encoder | D14 / A0 | INPUT, senza pull-up interno, interrupt CHANGE |
 
-Si contano sia salita sia discesa: un impulso completo alto/basso vale due
-fronti. L'encoder deve fornire livelli definiti e compatibili con il Nano Every,
-con massa comune alla scheda. D3 comanda lo stadio di potenza del motore.
+Si contano salita e discesa: un impulso completo alto/basso vale due fronti.
+L'encoder deve fornire livelli definiti e compatibili, con massa comune alla
+scheda. D3 comanda lo stadio di potenza del motore.
 
-Il repository locale puo' essere la cartella `GIN`. Nelle preferenze dell'IDE
-impostare **Posizione sketchbook** sulla cartella `GIN/sketchbook`, oppure
-aprire direttamente `sketchbook/FrenoPneumatico/FrenoPneumatico.ino`.
-La cartella dello sketch ha lo stesso nome del file `.ino`, come richiesto
-da Arduino. Installare **Arduino megaAVR Boards**, scegliere **Arduino Nano
-Every** e **Registers emulation: None (ATMEGA4809)**.
-
-All'alimentazione o reset parte automaticamente la precarica di 2,5 secondi.
-Non serve inviare un comando di avvio. Per una nuova prova dopo uno stop,
-`a` ripete la precarica e ripristina l'impulso a 200 ms.
-
-## Seriale
-
-Monitor seriale a **115200 baud**. Sono rimasti due comandi:
+All'alimentazione o reset parte automaticamente il pregonfiaggio.
+Monitor seriale a **115200 baud**, con o senza terminazione di riga:
 
 | Comando | Effetto |
 | --- | --- |
-| `s` | Spegne la pompa e ferma il controllo, anche durante la precarica |
-| `a` | Da `FERMO`, avvia una nuova prova con precarica e impulso iniziale |
+| `s` | Passa a `FERMO` e spegne la pompa nello stesso loop |
+| `a` | Da `FERMO`, riparte con pregonfiaggio e durata iniziale di 200 ms |
 
-Si possono inviare con o senza terminazione di riga. `a` durante una prova
-attiva viene ignorato. I parametri si modificano nel sorgente.
+`a` durante una prova attiva viene ignorato. Una nuova prova cancella i
+campioni della precedente. Le operazioni usano `millis()`, senza `delay()`.
 
-Una riga di stato al secondo ha il formato:
+Il log, una riga al secondo se il buffer ha spazio, e':
 
 ```text
-S,stato,P,impulso_ms,N,fronti_scatto,T,periodo_precedente_ms
+S,stato,P,durata_motor_on_ms,N,fronti_periodo,T,periodo_ms
 ```
 
-Stati: 0=precarica, 1=attesa fronte, 2=impulso, 3=attesa blocco, 4=fermo.
-`P` indica l'impulso di frenatura, anche durante la precarica da 2500 ms.
-`N` include tutti i fronti dello scatto; resta visibile dopo il blocco.
-`T` e' il tempo del ciclo appena confrontato con il suo conteggio precedente;
-vale 0 finche' non inizia il secondo scatto.
-La riga viene saltata se il buffer seriale non ha spazio sufficiente, per
-non attendere la seriale mentre si devono rispettare i tempi della pompa.
+Stati: 0=pregonfiaggio, 1=attesa arresto, 2=attesa primo fronte,
+3=motor-on, 4=fermo. `N` e `T` descrivono lo stesso ultimo intervallo completato
+tra due motor-on; valgono 0 fino al secondo motor-on. `P` e' la durata corretta
+dell'impulso di controllo, anche durante il pregonfiaggio da 2500 ms.
 
-## Perche' resta util/atomic.h
+## Lettura atomica e verifiche
 
-L'interrupt conta i fronti e registra il primo e l'ultimo istante. Su questo
-microcontrollore a 8 bit la copia dei valori a 32 bit deve essere protetta
-con `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)`: interrompe brevemente gli interrupt
-per copiare e azzerare il conteggio pendente, poi ripristina lo stato precedente.
-La versione reale di `<util/atomic.h>` e' fornita dalla toolchain AVR.
-
-`tests/mock/util/atomic.h` e `tests/mock/Arduino.h` servono soltanto ai test
-sequenziali sul PC; non devono essere copiati nello sketch. Il mock atomico
-esegue il blocco una volta e non verifica la concorrenza reale degli interrupt.
-
-## Verifiche
+L'interrupt incrementa soltanto `encoderTotale`. La lettura usa
+`ATOMIC_BLOCK(ATOMIC_RESTORESTATE)` della toolchain AVR: protegge la copia
+a 32 bit sul microcontrollore a 8 bit e ripristina lo stato degli interrupt.
+`tests/mock/util/atomic.h` e `tests/mock/Arduino.h` servono solo ai test PC,
+non vanno copiati nello sketch e non verificano la concorrenza reale degli ISR.
 
 Dalla radice del repository, con il core installato:
 
@@ -138,7 +155,7 @@ Dalla radice del repository, con il core installato:
 arduino-cli compile --fqbn arduino:megaavr:nona4809:mode=off sketchbook/FrenoPneumatico
 ```
 
-Nel cloud e' disponibile il comando:
+Nel cloud:
 
 ```sh
 /workspace/.tools/arduino/compile-nano-every.sh
@@ -149,9 +166,10 @@ AVR GCC Debian 14.2.0, diverso da quello del pacchetto Arduino standard.
 Gli indici remoti e i tool di discovery non disponibili non impediscono
 la compilazione con il core locale. Il caricamento USB non e' verificato.
 
-I test verificano dieci gruppi: precarica/pin, impulso al primo fronte,
-timeout rinnovato, soglia stretta e conteggio precedente, fronti accodati,
-moto continuo, durata minima, stop/riavvio, rollover e seriale congestionata.
+I test verificano 13 gruppi: avvio/pin, ONCE, movimento dopo pregonfiaggio,
+nuovi impulsi durante l'attesa, correzione e conteggio, timestamp motor-on,
+moto continuo, minimo, massimo, stop/riavvio, rollover del tempo e del
+contatore, seriale congestionata.
 
 ```sh
 set -e
@@ -162,7 +180,7 @@ g++ -std=c++11 -Wall -Wextra -Werror -pedantic \
 /tmp/gin-tests/controller_test
 ```
 
-Se LeakSanitizer non puo' funzionare sotto `ptrace`, avviare il binario con
-`ASAN_OPTIONS=detect_leaks=0`. Rimangono attivi AddressSanitizer e
-UndefinedBehaviorSanitizer. I test simulati verificano il firmware; il tempo
-per bloccare il freno e la risposta pneumatica vanno osservati sul prototipo.
+Se LeakSanitizer non puo' funzionare sotto `ptrace`, usare
+`ASAN_OPTIONS=detect_leaks=0`: rimangono attivi AddressSanitizer e
+UndefinedBehaviorSanitizer. I test simulati verificano il firmware; la
+risposta pneumatica e il tempo reale di arresto vanno osservati sul prototipo.

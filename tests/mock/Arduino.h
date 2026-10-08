@@ -12,13 +12,16 @@ constexpr int LOW = 0, HIGH = 1, INPUT = 0, OUTPUT = 1, INPUT_PULLUP = 2, CHANGE
 
 namespace hardware {
   extern uint64_t timeUs;
-  extern int levels[24], modes[24];
+  extern int levels[24], modes[24], writes[24];
   extern void (*interrupt)();
   extern int interruptPin, interruptMode;
 }
 inline uint32_t micros() { return uint32_t(hardware::timeUs); }
 inline uint32_t millis() { return uint32_t(hardware::timeUs / 1000); }
-inline void digitalWrite(uint8_t pin, int level) { hardware::levels[pin] = level; }
+inline void digitalWrite(uint8_t pin, int level) {
+  hardware::levels[pin] = level;
+  ++hardware::writes[pin];
+}
 inline void pinMode(uint8_t pin, int mode) { hardware::modes[pin] = mode; }
 inline int digitalPinToInterrupt(uint8_t pin) { return pin; }
 inline void attachInterrupt(int pin, void (*fn)(), int mode) {

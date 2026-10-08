@@ -2,141 +2,162 @@
 #include <util/atomic.h>
 #include <stdio.h>
 
-// Parametri della prima prova: modificare questi valori per tarare il sistema.
+// Parametri della prima prova.
 constexpr uint8_t MOTOR_PIN = 3;
-constexpr uint8_t ENCODER_PIN = A0;            // D14 sul Nano Every.
-constexpr uint32_t PRECARICA_MS = 2500;
+constexpr uint8_t ENCODER_PIN = A0;             // D14, senza pull-up interno.
+constexpr uint32_t PRE_GONFIAGGIO_MS = 2500;
+constexpr uint32_t TIMEOUT_ARRESTO_MS = 300;
+constexpr uint32_t MS_PER_FRONTE = 600;
 constexpr uint16_t IMPULSO_INIZIALE_MS = 200;
 constexpr uint16_t PASSO_MS = 20;
 constexpr uint16_t IMPULSO_MINIMO_MS = 20;
-constexpr uint32_t MS_PER_FRONTE = 600;
-constexpr uint32_t TIMEOUT_BLOCCO_MS = 300;    // Silenzio encoder per blocco presunto.
+constexpr uint16_t IMPULSO_MASSIMO_MS = 400;
 
-enum Stato { PRECARICA, ATTENDI_FRONTE, IMPULSO, ATTENDI_BLOCCO, FERMO };
+enum Stato { PRE_GONFIAGGIO, ATTENDI_ARRESTO, ATTENDI_PRIMO_FRONTE, MOTOR_ON, FERMO };
 Stato stato = FERMO;
-uint16_t durataImpulsoMs = IMPULSO_INIZIALE_MS;
-uint32_t inizioAccensioneMs = 0;
-uint32_t inizioScattoMs = 0;
-uint32_t ultimoFronteScattoMs = 0;
-uint32_t frontiScatto = 0;
+bool ingressoStato = true;                     // true soltanto dopo una transizione.
+uint32_t inizioStatoMs = 0;
+uint16_t durataMotorOnMs = IMPULSO_INIZIALE_MS;
+
+// Campioni presi a ogni motor-on: tempo e contatore hanno gli stessi confini.
+volatile uint32_t encoderTotale = 0;
+uint32_t totaleLetto = 0;
+bool precedenteMotorOnValido = false;
+uint32_t precedenteMotorOnMs = 0;
+uint32_t totaleAlMotorOn = 0;
 uint32_t ultimoPeriodoMs = 0;
+uint32_t frontiPeriodo = 0;
 uint32_t ultimoLogMs = 0;
 
-// L'interrupt registra tutti i fronti; il loop li ritira insieme.
-volatile uint32_t frontiPendenti = 0;
-volatile uint32_t primoFronteMs = 0;
-volatile uint32_t ultimoFronteMs = 0;
-
-struct LetturaEncoder {
-  uint32_t fronti;
-  uint32_t primoMs;
-  uint32_t ultimoMs;
-};
-
 void encoderISR() {
-  const uint32_t now = millis();
-  if (frontiPendenti == 0) primoFronteMs = now;
-  ultimoFronteMs = now;
-  ++frontiPendenti;
+  ++encoderTotale;                             // CHANGE: conta salita e discesa.
 }
 
-LetturaEncoder leggiEncoder() {
-  LetturaEncoder lettura;
-  // Su AVR una lettura a 32 bit richiede piu' istruzioni: proteggiamo la copia.
-  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    lettura.fronti = frontiPendenti;
-    lettura.primoMs = primoFronteMs;
-    lettura.ultimoMs = ultimoFronteMs;
-    frontiPendenti = 0;
+uint32_t leggiEncoder() {
+  uint32_t totale;
+  // Copia atomica: AVR legge il contatore a 32 bit in piu' istruzioni.
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { totale = encoderTotale; }
+  return totale;
+}
+
+void cambiaStato(Stato nuovoStato) {
+  if (nuovoStato == stato) return;
+  stato = nuovoStato;
+  ingressoStato = true;
+}
+
+void correggiDurata(uint32_t now, uint32_t totale) {
+  if (precedenteMotorOnValido) {
+    ultimoPeriodoMs = uint32_t(now - precedenteMotorOnMs);
+    frontiPeriodo = uint32_t(totale - totaleAlMotorOn);
+    const uint64_t tempoObiettivoMs = uint64_t(frontiPeriodo) * MS_PER_FRONTE;
+
+    // Lento: meno gonfiaggio. Rapido: piu' gonfiaggio. Uguale: nessuna modifica.
+    int32_t nuovaDurataMs = durataMotorOnMs;
+    if (ultimoPeriodoMs > tempoObiettivoMs) nuovaDurataMs -= PASSO_MS;
+    else if (ultimoPeriodoMs < tempoObiettivoMs) nuovaDurataMs += PASSO_MS;
+    if (nuovaDurataMs < IMPULSO_MINIMO_MS) nuovaDurataMs = IMPULSO_MINIMO_MS;
+    if (nuovaDurataMs > IMPULSO_MASSIMO_MS) nuovaDurataMs = IMPULSO_MASSIMO_MS;
+    durataMotorOnMs = uint16_t(nuovaDurataMs);
   }
-  return lettura;
+  precedenteMotorOnMs = now;
+  totaleAlMotorOn = totale;
+  precedenteMotorOnValido = true;
 }
 
-void avvia(uint32_t now) {
-  durataImpulsoMs = IMPULSO_INIZIALE_MS;
-  frontiScatto = 0;
-  ultimoPeriodoMs = 0;
-  inizioAccensioneMs = now;
-  stato = PRECARICA;
-  digitalWrite(MOTOR_PIN, HIGH);
-}
+void aggiornaFreno(uint32_t now, uint32_t totale) {
+  bool nuovoFronte = uint32_t(totale - totaleLetto) != 0;
+  totaleLetto = totale;
 
-void aggiornaFreno(uint32_t now, const LetturaEncoder &encoder) {
-  switch (stato) {
-    case PRECARICA:
-      // Una sola precarica; i fronti di questa fase non fanno parte dei cicli.
-      if (uint32_t(now - inizioAccensioneMs) >= PRECARICA_MS) {
-        digitalWrite(MOTOR_PIN, LOW);
-        stato = ATTENDI_FRONTE;
-      }
-      break;
+  // Una transizione esegue subito il once del nuovo stato, nello stesso loop.
+  for (;;) {
+    const bool once = ingressoStato;
+    ingressoStato = false;
 
-    case ATTENDI_FRONTE:
-      if (encoder.fronti == 0) break;
-
-      // Dal secondo scatto confrontiamo primo fronte -> primo fronte.
-      // n include il primo fronte e tutti quelli prima del blocco precedente.
-      if (frontiScatto != 0) {
-        ultimoPeriodoMs = uint32_t(encoder.primoMs - inizioScattoMs);
-        const uint64_t tempoObiettivoMs = uint64_t(frontiScatto) * MS_PER_FRONTE;
-        if (ultimoPeriodoMs > tempoObiettivoMs) {
-          durataImpulsoMs = durataImpulsoMs > IMPULSO_MINIMO_MS + PASSO_MS
-              ? durataImpulsoMs - PASSO_MS : IMPULSO_MINIMO_MS;
+    switch (stato) {
+      case PRE_GONFIAGGIO:
+        if (once) {                            // ONCE: prepara una nuova prova.
+          durataMotorOnMs = IMPULSO_INIZIALE_MS;
+          precedenteMotorOnValido = false;
+          ultimoPeriodoMs = frontiPeriodo = 0;
+          inizioStatoMs = now;
+          digitalWrite(MOTOR_PIN, HIGH);
         }
-      }
+        // ALWAYS: termina il pregonfiaggio dopo 2,5 secondi.
+        if (uint32_t(now - inizioStatoMs) >= PRE_GONFIAGGIO_MS) {
+          nuovoFronte = false;                 // I fronti del pregonfiaggio sono ignorati.
+          cambiaStato(ATTENDI_ARRESTO);
+          continue;
+        }
+        break;
 
-      inizioScattoMs = encoder.primoMs;
-      ultimoFronteScattoMs = encoder.ultimoMs;
-      frontiScatto = encoder.fronti;
-      inizioAccensioneMs = now;
-      // Se si sceglie un minimo di 0 ms, a zero osserviamo senza accendere.
-      stato = durataImpulsoMs != 0 ? IMPULSO : ATTENDI_BLOCCO;
-      digitalWrite(MOTOR_PIN, durataImpulsoMs != 0 ? HIGH : LOW);
-      break;
-
-    case IMPULSO:
-    case ATTENDI_BLOCCO:
-      // I nuovi fronti vengono contati anche a pompa accesa e durante l'attesa.
-      // Non comandano altri impulsi e non prolungano quello gia' in corso.
-      frontiScatto += encoder.fronti;
-      if (encoder.fronti != 0) ultimoFronteScattoMs = encoder.ultimoMs;
-
-      if (stato == IMPULSO) {
-        if (uint32_t(now - inizioAccensioneMs) >= durataImpulsoMs) {
+      case ATTENDI_ARRESTO:
+        if (once) {                            // ONCE: spegni e avvia il timeout.
           digitalWrite(MOTOR_PIN, LOW);
-          stato = ATTENDI_BLOCCO;
+          inizioStatoMs = now;
         }
-      } else if (uint32_t(now - ultimoFronteScattoMs) >= TIMEOUT_BLOCCO_MS) {
-        // Blocco presunto: conserviamo n per il prossimo primo fronte.
-        stato = ATTENDI_FRONTE;
-      }
-      break;
+        // ALWAYS: se scatta, frena; altrimenti conferma l'arresto col timeout.
+        if (nuovoFronte) {
+          cambiaStato(MOTOR_ON);
+          continue;
+        }
+        if (uint32_t(now - inizioStatoMs) >= TIMEOUT_ARRESTO_MS) {
+          cambiaStato(ATTENDI_PRIMO_FRONTE);
+          continue;
+        }
+        break;
 
-    case FERMO:
-      break;
+      case ATTENDI_PRIMO_FRONTE:
+        if (once) {                            // ONCE: lascia il motore spento.
+          digitalWrite(MOTOR_PIN, LOW);
+        }
+        // ALWAYS: il primo fronte dopo l'arresto avvia un impulso.
+        if (nuovoFronte) {
+          cambiaStato(MOTOR_ON);
+          continue;
+        }
+        break;
+
+      case MOTOR_ON:
+        if (once) {                            // ONCE: correggi e accendi una volta.
+          correggiDurata(now, totale);
+          inizioStatoMs = now;
+          digitalWrite(MOTOR_PIN, durataMotorOnMs != 0 ? HIGH : LOW);
+        }
+        // ALWAYS: i fronti si contano, senza riavviare il timer del motore.
+        nuovoFronte = false;
+        if (uint32_t(now - inizioStatoMs) >= durataMotorOnMs) {
+          cambiaStato(ATTENDI_ARRESTO);
+          continue;
+        }
+        break;
+
+      case FERMO:
+        if (once) {                            // ONCE: stop manuale della pompa.
+          digitalWrite(MOTOR_PIN, LOW);
+        }
+        // ALWAYS: resta fermo fino al comando a.
+        break;
+    }
+    return;
   }
 }
 
 void leggiComandi() {
-  // Bastano s=stop e a=nuova prova. La lettura limitata mantiene rapido il loop.
   for (uint8_t i = 0; i < 8 && Serial.available() > 0; ++i) {
     const char comando = char(Serial.read());
-    if (comando == 's') {
-      digitalWrite(MOTOR_PIN, LOW);
-      stato = FERMO;
-    } else if (comando == 'a' && stato == FERMO) {
-      avvia(millis());
-    }
+    if (comando == 's') cambiaStato(FERMO);
+    else if (comando == 'a' && stato == FERMO) cambiaStato(PRE_GONFIAGGIO);
   }
 }
 
 void stampaStato(uint32_t now) {
-  // Una riga breve al secondo, solo se entra nel buffer: la seriale non attende.
+  // Una riga al secondo solo se entra nel buffer, senza aspettare la seriale.
   char riga[60];
   if (uint32_t(now - ultimoLogMs) < 1000 || Serial.availableForWrite() < 60) return;
   ultimoLogMs = now;
   snprintf(riga, sizeof(riga), "S,%u,P,%u,N,%lu,T,%lu\n", unsigned(stato),
-           unsigned(durataImpulsoMs), (unsigned long)frontiScatto,
+           unsigned(durataMotorOnMs), (unsigned long)frontiPeriodo,
            (unsigned long)ultimoPeriodoMs);
   Serial.print(riga);
 }
@@ -146,17 +167,18 @@ void setup() {
   digitalWrite(11, HIGH); pinMode(11, OUTPUT);
   digitalWrite(6, HIGH); pinMode(6, OUTPUT);
   digitalWrite(4, LOW); pinMode(4, OUTPUT);
-  digitalWrite(ENCODER_PIN, LOW);
-  pinMode(ENCODER_PIN, INPUT);                 // Encoder SENZA pull-up interno.
+  digitalWrite(ENCODER_PIN, LOW); pinMode(ENCODER_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, CHANGE);
   Serial.begin(115200);
-  avvia(millis());                            // Precarica automatica all'avvio.
+  cambiaStato(PRE_GONFIAGGIO);
+  const uint32_t totale = leggiEncoder();
+  aggiornaFreno(millis(), totale);             // Esegue subito il once iniziale.
 }
 
 void loop() {
-  const LetturaEncoder encoder = leggiEncoder();
-  const uint32_t now = millis();              // Dopo la copia: mai prima dei fronti.
-  aggiornaFreno(now, encoder);
-  leggiComandi();
+  leggiComandi();                             // Lo stop viene eseguito in questo loop.
+  const uint32_t totale = leggiEncoder();
+  const uint32_t now = millis();
+  aggiornaFreno(now, totale);
   stampaStato(now);
 }
