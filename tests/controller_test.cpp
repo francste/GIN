@@ -159,11 +159,11 @@ static void fixed_wait_ignores_edges_but_keeps_them_in_correction() {
 static void correction_uses_same_time_and_counter_window() {
   three_edges_between_motor_starts(); Serial.output.clear(); edge(5400);
   assert(ultimoPeriodoMs == 2400 && frontiPeriodo == 4 && durataMotorOnMs == 200);
-  assert(Serial.output == "Impulso 200 ms, fronti 4, correzione +0 ms\n");
+  assert(Serial.output == "Imp:200 Corr: +0 Dt:      2400 Fr:         4\n");
   // Il fronte che avvia il nuovo motor-on chiude il campione precedente.
   tick(5600); tick(5900); Serial.output.clear(); edge(6001);
   assert(ultimoPeriodoMs == 601 && frontiPeriodo == 1 && durataMotorOnMs == 180);
-  assert(Serial.output == "Impulso 180 ms, fronti 1, correzione -20 ms\n");
+  assert(Serial.output == "Imp:180 Corr:-20 Dt:       601 Fr:         1\n");
   const int writes = hardware::writes[3];
   tick(6002); tick(6100); tick(6180);
   assert(durataMotorOnMs == 180 && hardware::writes[3] == writes);
@@ -171,10 +171,10 @@ static void correction_uses_same_time_and_counter_window() {
 
   three_edges_between_motor_starts(); Serial.output.clear(); edge(5401);
   assert(ultimoPeriodoMs == 2401 && frontiPeriodo == 4 && durataMotorOnMs == 180);
-  assert(Serial.output == "Impulso 180 ms, fronti 4, correzione -20 ms\n");
+  assert(Serial.output == "Imp:180 Corr:-20 Dt:      2401 Fr:         4\n");
   three_edges_between_motor_starts(); Serial.output.clear(); edge(4000);
   assert(ultimoPeriodoMs == 1000 && frontiPeriodo == 4 && durataMotorOnMs == 220);
-  assert(Serial.output == "Impulso 220 ms, fronti 4, correzione +20 ms\n");
+  assert(Serial.output == "Imp:220 Corr:+20 Dt:      1000 Fr:         4\n");
 }
 
 static void delayed_loop_measures_actual_motor_on_time() {
@@ -184,8 +184,9 @@ static void delayed_loop_measures_actual_motor_on_time() {
   tick(3249); assert(hardware::levels[3] == HIGH);
   tick(3250); assert(hardware::levels[3] == LOW);
   tick(3550); assert(stato == ATTENDI_FRONTE);
-  edge(3650, false); tick(3651);
+  Serial.output.clear(); edge(3650, false); tick(3651);
   assert(ultimoPeriodoMs == 601 && frontiPeriodo == 1 && durataMotorOnMs == 180);
+  assert(Serial.output == "Imp:180 Corr:-20 Dt:       601 Fr:         1\n");
 }
 
 static void continuous_motion_is_served_by_separate_pulses() {
@@ -217,7 +218,7 @@ static void maximum_motor_on_duration() {
     edge(start);
     assert(durataMotorOnMs == expected[cycle]);
     if (cycle >= 11)
-      assert(Serial.output == "Impulso 400 ms, fronti 3, correzione +0 ms\n");
+      assert(Serial.output == "Imp:400 Corr: +0 Dt:      1000 Fr:         3\n");
     edge(start + 50); edge(start + 100);
     tick(start + expected[cycle]);
     assert(hardware::levels[3] == LOW);
@@ -236,9 +237,9 @@ static void minimum_motor_on_duration() {
     edge(start);
     assert(durataMotorOnMs == expected[cycle] && hardware::levels[3] == HIGH);
     if (cycle == 8)
-      assert(Serial.output == "Impulso 50 ms, fronti 1, correzione -10 ms\n");
+      assert(Serial.output == "Imp: 50 Corr:-10 Dt:      1000 Fr:         1\n");
     if (cycle >= 9)
-      assert(Serial.output == "Impulso 50 ms, fronti 1, correzione +0 ms\n");
+      assert(Serial.output == "Imp: 50 Corr: +0 Dt:      1000 Fr:         1\n");
     tick(start + expected[cycle]);
     assert(hardware::levels[3] == LOW);
     tick(start + expected[cycle] + 300);
@@ -269,8 +270,9 @@ static void millis_rollover() {
   edge(first); tick(first + 199); assert(hardware::levels[3] == HIGH);
   tick(first + 200); assert(hardware::levels[3] == LOW);
   tick(first + 500); assert(stato == ATTENDI_FRONTE);
-  edge(first + 601);
+  Serial.output.clear(); edge(first + 601);
   assert(ultimoPeriodoMs == 601 && frontiPeriodo == 1 && durataMotorOnMs == 180);
+  assert(Serial.output == "Imp:180 Corr:-20 Dt:       601 Fr:         1\n");
 }
 
 static void encoder_counter_rollover() {
@@ -298,22 +300,22 @@ static void serial_logs_startup_once_and_each_motor_pulse_once() {
   assert(Serial.output == "Avvio freno\n");
 
   Serial.output.clear(); edge(3000);
-  assert(Serial.output == "Impulso 200 ms, fronti 0, correzione +0 ms\n");
+  assert(Serial.output == "Imp:200 Corr: +0 Dt:         0 Fr:         0\n");
   tick(3001); edge(3100); tick(3200); tick(3500);
-  assert(Serial.output == "Impulso 200 ms, fronti 0, correzione +0 ms\n");
+  assert(Serial.output == "Imp:200 Corr: +0 Dt:         0 Fr:         0\n");
 
   edge(4301); tick(4481); tick(4781);
   Serial.receive("s"); tick(4782);
   Serial.receive("a"); tick(4783);
   tick(7283); tick(7583); edge(7600);
-  assert(Serial.output == "Impulso 200 ms, fronti 0, correzione +0 ms\n"
-                          "Impulso 180 ms, fronti 2, correzione -20 ms\n"
-                          "Impulso 200 ms, fronti 0, correzione +0 ms\n");
+  assert(Serial.output == "Imp:200 Corr: +0 Dt:         0 Fr:         0\n"
+                          "Imp:180 Corr:-20 Dt:      1301 Fr:         2\n"
+                          "Imp:200 Corr: +0 Dt:         0 Fr:         0\n");
 }
 
 static void serial_logs_need_space_for_the_whole_line() {
   reset(); ready(); Serial.output.clear();
-  const std::string expected = "Impulso 200 ms, fronti 0, correzione +0 ms\n";
+  const std::string expected = "Imp:200 Corr: +0 Dt:         0 Fr:         0\n";
   Serial.txSpace = int(expected.size()) - 1;
   edge(3000);
   assert(Serial.output.empty() && stato == MOTOR_ON && hardware::levels[3] == HIGH);

@@ -161,19 +161,25 @@ avvio di un impulso di controllo (`MOTOR_ON`). Esempio:
 
 ```text
 Avvio freno
-Impulso 200 ms, fronti 0, correzione +0 ms
-Impulso 180 ms, fronti 1, correzione -20 ms
-Impulso 200 ms, fronti 3, correzione +20 ms
+Imp:200 Corr: +0 Dt:         0 Fr:         0
+Imp:180 Corr:-20 Dt:       601 Fr:         1
+Imp:200 Corr:+20 Dt:      1000 Fr:         3
 ```
 
-La durata e' quella applicata all'impulso appena avviato. I fronti sono
+I campi sono nell'ordine impulso, correzione, tempo dal precedente impulso,
+fronti. `Imp`, `Corr` e `Dt` sono in millisecondi; `Fr` e' il numero di fronti.
+Le larghezze fisse sono 3, 3, 10 e 10 caratteri, con allineamento a destra
+e segno nella correzione. Ogni riga occupa 45 byte, incluso il newline.
+
+`Imp` e' la durata applicata all'impulso appena avviato; `Dt` e' il tempo
+tra gli avvii del motore, lo stesso usato dalla correzione. I fronti sono
 quelli accettati tra il precedente motor-on e quello attuale, incluso il
 fronte che avvia il nuovo impulso. La correzione indica la variazione
 effettiva della durata: da 60 a 50 ms vale `-10 ms`; ai limiti minimo o
 massimo vale `+0 ms` se la durata resta invariata.
 
-Il primo impulso registra solo la base del confronto: fronti e correzione
-valgono 0. Anche il primo impulso dopo il comando `a` riparte cosi', senza
+Il primo impulso registra solo la base del confronto: tempo, fronti e
+correzione valgono 0. Anche il primo impulso dopo il comando `a` riparte cosi', senza
 ripetere la stringa di avvio. Il pregonfiaggio da 2500 ms non genera una
 riga impulso. Non ci sono messaggi periodici o di cambio stato.
 

@@ -53,10 +53,12 @@ uint32_t leggiEncoder() {
 
 void stampaImpulso(int16_t correzioneMs) {
   char riga[64];
+  // Tempi in ms. Campi fissi: impulso 3, correzione 3, periodo e fronti 10.
   const int lunghezza = snprintf(riga, sizeof(riga),
-                                "Impulso %u ms, fronti %lu, correzione %+d ms\n",
-                                unsigned(durataMotorOnMs),
-                                (unsigned long)frontiPeriodo, int(correzioneMs));
+                                "Imp:%3u Corr:%+3d Dt:%10lu Fr:%10lu\n",
+                                unsigned(durataMotorOnMs), int(correzioneMs),
+                                (unsigned long)ultimoPeriodoMs,
+                                (unsigned long)frontiPeriodo);
   // Nessuna attesa per la UART: stampa solo se entra l'intera riga.
   if (lunghezza > 0 && lunghezza < int(sizeof(riga)) &&
       Serial.availableForWrite() >= lunghezza) Serial.print(riga);
