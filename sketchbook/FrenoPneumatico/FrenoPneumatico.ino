@@ -7,16 +7,18 @@ constexpr uint8_t MOTOR_PIN = 3;
 constexpr uint8_t ENCODER_PIN = A0;             // D14, senza pull-up interno.
 constexpr uint8_t DEBUG_PIN = 12;               // PE1 sul Nano Every.
 constexpr uint32_t ENCODER_HOLDOFF_US = 2000;
-constexpr uint32_t PRE_GONFIAGGIO_MS = 2500;
+constexpr uint32_t PRE_GONFIAGGIO_MS = 1500;
 constexpr uint32_t TIMEOUT_ARRESTO_MS = 300;
 constexpr uint32_t MS_PER_FRONTE = 600;
-constexpr uint16_t IMPULSO_FISSO_MS = 70;       // Durata di ogni accensione di controllo.
+constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 150; // Prima accensione di ogni sequenza.
+constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 70;
 constexpr uint16_t RICHIESTA_INIZIALE_MS = 200;
 constexpr uint16_t PASSO_MS = 20;
 constexpr uint16_t RICHIESTA_MINIMA_MS = 50;
 constexpr uint16_t RICHIESTA_MASSIMA_MS = 400;
-static_assert(IMPULSO_FISSO_MS > 0 && IMPULSO_FISSO_MS <= RICHIESTA_MASSIMA_MS,
-              "IMPULSO_FISSO_MS deve essere tra 1 e RICHIESTA_MASSIMA_MS");
+static_assert(IMPULSO_BLOCCAGGIO_MS > 0 && IMPULSO_BLOCCAGGIO_MS <= RICHIESTA_MASSIMA_MS &&
+              IMPULSO_MANTENIMENTO_MS > 0 && IMPULSO_MANTENIMENTO_MS <= RICHIESTA_MASSIMA_MS,
+              "Le durate degli impulsi devono essere tra 1 e RICHIESTA_MASSIMA_MS");
 
 enum Stato { PRE_GONFIAGGIO, ATTENDI_ARRESTO, ATTENDI_FRONTE,
              MOTOR_ON, ATTENDI_IMPULSO, FERMO };
@@ -58,12 +60,16 @@ uint32_t leggiEncoder() {
   return totale;
 }
 
+uint16_t durataImpulsoMs() {
+  return indiceImpulso == 0 ? IMPULSO_BLOCCAGGIO_MS : IMPULSO_MANTENIMENTO_MS;
+}
+
 void stampaImpulso(int16_t correzioneMs) {
   char riga[64];
   // Tempi in ms. Req = totale richiesto; N = accensione attuale / numero totale.
   const int lunghezza = snprintf(riga, sizeof(riga),
                                 "Imp:%3u Corr:%+3d Dt:%10lu Fr:%10lu Req:%3u N:%3u/%3u\n",
-                                unsigned(IMPULSO_FISSO_MS), int(correzioneMs),
+                                unsigned(durataImpulsoMs()), int(correzioneMs),
                                 (unsigned long)ultimoPeriodoMs,
                                 (unsigned long)frontiPeriodo, unsigned(tempoRichiestoMs),
                                 unsigned(indiceImpulso + 1), unsigned(numeroImpulsi));
@@ -96,13 +102,18 @@ void preparaSequenza(uint32_t now, uint32_t totale) {
   totaleAllaSequenza = totale;
   precedenteSequenzaValida = true;
 
-  // Arrotonda per difetto; garantisce almeno un'accensione.
-  numeroImpulsi = tempoRichiestoMs / IMPULSO_FISSO_MS;
-  if (numeroImpulsi == 0) numeroImpulsi = 1;
-  if (ultimoPeriodoMs == 0) numeroImpulsi = 1; // Prima sequenza: manca ancora Dt.
-  else {
-    // Con altri parametri evita sovrapposizioni: almeno 1 ms spento fra accensioni.
-    const uint32_t capienza = ultimoPeriodoMs / (uint32_t(IMPULSO_FISSO_MS) + 1);
+  // Il bloccaggio e' sempre presente. Il mantenimento usa solo il residuo.
+  numeroImpulsi = 1;
+  if (ultimoPeriodoMs > 0 &&
+      tempoRichiestoMs > uint32_t(IMPULSO_BLOCCAGGIO_MS) + IMPULSO_MANTENIMENTO_MS) {
+    numeroImpulsi += (tempoRichiestoMs - IMPULSO_BLOCCAGGIO_MS) / IMPULSO_MANTENIMENTO_MS;
+  }
+  // Prima sequenza: manca Dt, quindi resta il solo impulso di bloccaggio.
+  if (numeroImpulsi > 1) {
+    // La distanza fra avvii deve contenere anche l'impulso piu' lungo e 1 ms spento.
+    const uint16_t impulsoPiuLungoMs = IMPULSO_BLOCCAGGIO_MS > IMPULSO_MANTENIMENTO_MS
+                                       ? IMPULSO_BLOCCAGGIO_MS : IMPULSO_MANTENIMENTO_MS;
+    const uint32_t capienza = ultimoPeriodoMs / (uint32_t(impulsoPiuLungoMs) + 1);
     if (numeroImpulsi > capienza) numeroImpulsi = capienza > 0 ? uint16_t(capienza) : 1;
   }
 }
@@ -128,7 +139,7 @@ void aggiornaFreno(uint32_t now, uint32_t totale) {
           inizioStatoMs = now;
           digitalWrite(MOTOR_PIN, HIGH);
         }
-        // ALWAYS: termina il pregonfiaggio dopo 2,5 secondi.
+        // ALWAYS: termina il pregonfiaggio dopo 1,5 secondi.
         if (uint32_t(now - inizioStatoMs) >= PRE_GONFIAGGIO_MS) {
           nuovoFronte = false;                 // I fronti del pregonfiaggio sono ignorati.
           cambiaStato(ATTENDI_ARRESTO);
@@ -175,7 +186,7 @@ void aggiornaFreno(uint32_t now, uint32_t totale) {
         }
         // ALWAYS: i fronti si contano, senza riavviare il timer del motore.
         nuovoFronte = false;
-        if (uint32_t(now - inizioStatoMs) >= IMPULSO_FISSO_MS) {
+        if (uint32_t(now - inizioStatoMs) >= durataImpulsoMs()) {
           ++indiceImpulso;
           cambiaStato(indiceImpulso < numeroImpulsi ? ATTENDI_IMPULSO : ATTENDI_ARRESTO);
           continue;
