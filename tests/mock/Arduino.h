@@ -21,6 +21,8 @@ extern MockPort PORTA, PORTD;
 namespace hardware {
   extern uint64_t timeUs;
   extern int levels[24], modes[24], writes[24];
+  extern int outputLevels[24];
+  extern bool pullups[24];
   extern void (*interrupt)();
   extern int interruptPin, interruptMode;
 }
@@ -28,10 +30,19 @@ inline uint32_t micros() { return uint32_t(hardware::timeUs); }
 inline uint32_t millis() { return uint32_t(hardware::timeUs / 1000); }
 inline int digitalRead(uint8_t pin) { return hardware::levels[pin]; }
 inline void digitalWrite(uint8_t pin, int level) {
-  hardware::levels[pin] = level;
+  // Core megaAVR: su un ingresso cambia il pull-up, senza precaricare l'uscita.
+  if (hardware::modes[pin] == OUTPUT) {
+    hardware::outputLevels[pin] = hardware::levels[pin] = level;
+  } else {
+    hardware::pullups[pin] = level != LOW;
+  }
   ++hardware::writes[pin];
 }
-inline void pinMode(uint8_t pin, int mode) { hardware::modes[pin] = mode; }
+inline void pinMode(uint8_t pin, int mode) {
+  hardware::modes[pin] = mode;
+  if (mode == OUTPUT) hardware::levels[pin] = hardware::outputLevels[pin];
+  else hardware::pullups[pin] = mode == INPUT_PULLUP;
+}
 inline int digitalPinToInterrupt(uint8_t pin) { return pin; }
 inline void attachInterrupt(int pin, void (*fn)(), int mode) {
   hardware::interruptPin = pin;

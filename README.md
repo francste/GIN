@@ -121,6 +121,11 @@ scegliere **Arduino Nano Every** e **Registers emulation: None (ATMEGA4809)**.
 | Ingresso aggiuntivo | PD6 | INPUT, buffer digitale attivo, senza pull-up o interrupt |
 | Ingresso aggiuntivo | PA6 | INPUT, buffer digitale attivo, senza pull-up o interrupt |
 
+In `setup()` ogni pin Arduino viene configurato con `pinMode()` prima di
+`digitalWrite()`. Nel core megaAVR, `digitalWrite(HIGH)` su un ingresso
+abilita il pull-up e non imposta il livello dell'uscita: per avviare D11 e
+D6 HIGH bisogna prima configurarli come OUTPUT.
+
 PD6 e PA6 vengono configurati direttamente in `setup()` tramite i registri
 `PORTD` e `PORTA`, anche se non hanno un numero nella variante Arduino Nano
 Every. `DIRCLR = PIN6_bm` imposta il solo bit 6 come ingresso;

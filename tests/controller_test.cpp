@@ -6,6 +6,8 @@
 namespace hardware {
   uint64_t timeUs = 0;
   int levels[24] = {}, modes[24] = {}, writes[24] = {};
+  int outputLevels[24] = {};
+  bool pullups[24] = {};
   void (*interrupt)() = nullptr;
   int interruptPin = -1, interruptMode = -1;
 }
@@ -27,6 +29,7 @@ static void reset(uint64_t startMs = 0) {
   Serial = MockSerial();
   for (int i = 0; i < 24; ++i) {
     hardware::levels[i] = hardware::modes[i] = hardware::writes[i] = 0;
+    hardware::outputLevels[i] = 0; hardware::pullups[i] = false;
   }
   hardware::interrupt = nullptr;
   hardware::interruptPin = hardware::interruptMode = -1;

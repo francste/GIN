@@ -198,12 +198,19 @@ void setup() {
   // Ingressi fisici fuori dalla mappatura Arduino: buffer attivo, senza pull-up o interrupt.
   PORTD.DIRCLR = PIN6_bm; PORTD.PIN6CTRL = 0;  // PD6.
   PORTA.DIRCLR = PIN6_bm; PORTA.PIN6CTRL = 0;  // PA6.
-  digitalWrite(MOTOR_PIN, LOW); pinMode(MOTOR_PIN, OUTPUT);
-  digitalWrite(11, HIGH); pinMode(11, OUTPUT);
-  digitalWrite(6, HIGH); pinMode(6, OUTPUT);
-  digitalWrite(4, LOW); pinMode(4, OUTPUT);
-  digitalWrite(ENCODER_PIN, LOW); pinMode(ENCODER_PIN, INPUT);
-  digitalWrite(DEBUG_PIN, LOW); pinMode(DEBUG_PIN, OUTPUT);
+  // Prima la direzione, poi il livello: il core megaAVR richiede questo ordine.
+  pinMode(MOTOR_PIN, OUTPUT);
+  digitalWrite(MOTOR_PIN, LOW);
+  pinMode(11, OUTPUT);
+  digitalWrite(11, HIGH);
+  pinMode(6, OUTPUT);
+  digitalWrite(6, HIGH);
+  pinMode(4, OUTPUT);
+  digitalWrite(4, LOW);
+  pinMode(ENCODER_PIN, INPUT);
+  digitalWrite(ENCODER_PIN, LOW);
+  pinMode(DEBUG_PIN, OUTPUT);
+  digitalWrite(DEBUG_PIN, LOW);
   digitalWrite(DEBUG_PIN, digitalRead(ENCODER_PIN));
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, CHANGE);
   Serial.begin(115200);
