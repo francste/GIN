@@ -210,21 +210,24 @@ distribuita su un periodo di 2000 ms, con correzione -20 ms all'inizio:
 
 ```text
 Imp:150 Corr:-20 Dt:      2000 Fr:         1 Req:300 N:  1/  3
-Imp: 70 Corr: +0 Dt:      2000 Fr:         1 Req:300 N:  2/  3
-Imp: 70 Corr: +0 Dt:      2000 Fr:         1 Req:300 N:  3/  3
+2/3
+3/3
 ```
 
 I primi campi restano nell'ordine impulso, correzione, tempo dal precedente
 avvio di sequenza, fronti. `Imp`, `Corr`, `Dt` e `Req` sono in millisecondi.
-`Imp` e' la durata dell'accensione attuale: 150 ms per il bloccaggio,
-70 ms per il mantenimento. `Req` e' il tempo totale richiesto dal regolatore;
-`N` indica l'accensione attuale e il numero totale.
-Le colonne hanno larghezze fisse; ogni riga occupa 63 byte, incluso il newline.
+La riga completa viene stampata solo sul primo impulso, quello di bloccaggio.
+`Imp` e' la sua durata di 150 ms; `Req` e' il tempo totale richiesto dal
+regolatore; `N` indica l'accensione attuale e il numero totale. Le colonne
+hanno larghezze fisse; la riga completa occupa 63 byte, incluso il newline.
+Per ogni mantenimento si stampa soltanto il progressivo, per esempio `2/3`
+e `3/3`: la numerazione include il bloccaggio iniziale, gia' indicato come `1/3`.
 
-`Corr` mostra la variazione effettiva della richiesta, applicata solo alla
-prima accensione della sequenza; sulle successive vale 0. `Dt` e `Fr`
+`Corr` mostra la variazione effettiva della richiesta, calcolata e applicata
+solo alla prima accensione della sequenza. `Dt` e `Fr`
 descrivono l'ultimo intervallo completato fra gli inizi di due sequenze e
-restano uguali nelle righe di quella sequenza. Il conteggio in corso continua
+restano invariati durante il mantenimento, senza essere ristampati.
+Il conteggio in corso continua
 nell'ISR e sara' campionato all'inizio della sequenza successiva.
 
 La prima sequenza stampa `Imp:150`, `Dt:0`, `Fr:0`, `Corr:+0`, `Req:200` e

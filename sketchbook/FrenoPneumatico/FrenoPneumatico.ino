@@ -66,13 +66,20 @@ uint16_t durataImpulsoMs() {
 
 void stampaImpulso(int16_t correzioneMs) {
   char riga[64];
-  // Tempi in ms. Req = totale richiesto; N = accensione attuale / numero totale.
-  const int lunghezza = snprintf(riga, sizeof(riga),
-                                "Imp:%3u Corr:%+3d Dt:%10lu Fr:%10lu Req:%3u N:%3u/%3u\n",
-                                unsigned(durataImpulsoMs()), int(correzioneMs),
-                                (unsigned long)ultimoPeriodoMs,
-                                (unsigned long)frontiPeriodo, unsigned(tempoRichiestoMs),
-                                unsigned(indiceImpulso + 1), unsigned(numeroImpulsi));
+  int lunghezza;
+  if (indiceImpulso == 0) {
+    // Solo il bloccaggio ha il campione completo e la correzione della richiesta.
+    lunghezza = snprintf(riga, sizeof(riga),
+                         "Imp:%3u Corr:%+3d Dt:%10lu Fr:%10lu Req:%3u N:%3u/%3u\n",
+                         unsigned(durataImpulsoMs()), int(correzioneMs),
+                         (unsigned long)ultimoPeriodoMs,
+                         (unsigned long)frontiPeriodo, unsigned(tempoRichiestoMs),
+                         unsigned(indiceImpulso + 1), unsigned(numeroImpulsi));
+  } else {
+    // Mantenimento: stampa soltanto il progressivo nella sequenza.
+    lunghezza = snprintf(riga, sizeof(riga), "%u/%u\n",
+                         unsigned(indiceImpulso + 1), unsigned(numeroImpulsi));
+  }
   // Nessuna attesa per la UART: stampa solo se entra l'intera riga.
   if (lunghezza > 0 && lunghezza < int(sizeof(riga)) &&
       Serial.availableForWrite() >= lunghezza) Serial.print(riga);

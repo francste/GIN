@@ -347,14 +347,20 @@ static void serial_logs_boot_and_every_physical_pulse_once() {
   Serial.output.clear(); edge(3000); tick(3001); tick(3150); edge(3200); tick(3450);
   assert(Serial.output == "Imp:150 Corr: +0 Dt:         0 Fr:         0 Req:200 N:  1/  1\n");
   tempoRichiestoMs = 320;
-  edge(4301); tick(4451); tick(4734); tick(4804); tick(5168); tick(5238);
+  edge(4301); tick(4451); edge(4600); tick(4734);
+  assert(tempoRichiestoMs == 300 && ultimoPeriodoMs == 1301 && frontiPeriodo == 2);
+  assert(precedenteSequenzaMs == 4301 && totaleAllaSequenza == 3);
+  tick(4804); edge(5000); tick(5168);
+  assert(tempoRichiestoMs == 300 && ultimoPeriodoMs == 1301 && frontiPeriodo == 2);
+  assert(precedenteSequenzaMs == 4301 && totaleAllaSequenza == 3);
+  tick(5238);
   Serial.receive("s"); tick(5300);
   Serial.receive("a"); tick(5301);
   tick(6801); tick(7101); edge(7200);
   assert(Serial.output == "Imp:150 Corr: +0 Dt:         0 Fr:         0 Req:200 N:  1/  1\n"
                           "Imp:150 Corr:-20 Dt:      1301 Fr:         2 Req:300 N:  1/  3\n"
-                          "Imp: 70 Corr: +0 Dt:      1301 Fr:         2 Req:300 N:  2/  3\n"
-                          "Imp: 70 Corr: +0 Dt:      1301 Fr:         2 Req:300 N:  3/  3\n"
+                          "2/3\n"
+                          "3/3\n"
                           "Imp:150 Corr: +0 Dt:         0 Fr:         0 Req:200 N:  1/  1\n");
 }
 
@@ -368,6 +374,14 @@ static void serial_logs_need_space_for_the_whole_line() {
   reset(); ready(); Serial.output.clear();
   Serial.txSpace = int(expected.size()); edge(3000);
   assert(Serial.output == expected);
+
+  example_sequence(); Serial.output.clear(); tick(5150);
+  Serial.txSpace = 3; tick(5666); // "2/3\n" non entra interamente.
+  assert(Serial.output.empty() && hardware::levels[3] == HIGH);
+  tick(5736); assert(hardware::levels[3] == LOW);
+  Serial.txSpace = 4; tick(6333); // La riga breve entra anche senza spazio per 63 byte.
+  assert(Serial.output == "3/3\n" && hardware::levels[3] == HIGH);
+  tick(6403); assert(hardware::levels[3] == LOW);
 }
 
 static void maintenance_threshold_is_strict_and_blocking_is_subtracted() {
