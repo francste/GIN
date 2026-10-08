@@ -2,8 +2,9 @@
 
 Tutto il firmware e' in `sketchbook/FrenoPneumatico/FrenoPneumatico.ino`.
 Ogni stato contiene una parte **ONCE**, eseguita all'ingresso, e una parte
-**ALWAYS**, eseguita a ogni loop. Il timer del motore e la correzione della
-sua durata vengono impostati solo nel ONCE di `MOTOR_ON`.
+**ALWAYS**, eseguita a ogni loop. Ogni accensione di controllo dura
+`IMPULSO_FISSO_MS`, inizialmente **70 ms**. La correzione modifica il tempo
+totale richiesto, dal quale si ricava il numero di accensioni della sequenza.
 
 ## Sequenza
 
@@ -12,16 +13,19 @@ stateDiagram-v2
     [*] --> PRE_GONFIAGGIO
     PRE_GONFIAGGIO --> ATTENDI_ARRESTO: 2500 ms
     ATTENDI_ARRESTO --> ATTENDI_FRONTE: 300 ms fissi
-    ATTENDI_FRONTE --> MOTOR_ON: nuovo fronte
-    MOTOR_ON --> ATTENDI_ARRESTO: fine impulso
+    ATTENDI_FRONTE --> MOTOR_ON: nuovo fronte, prima accensione
+    MOTOR_ON --> ATTENDI_IMPULSO: 70 ms, altre accensioni previste
+    ATTENDI_IMPULSO --> MOTOR_ON: istante programmato
+    MOTOR_ON --> ATTENDI_ARRESTO: 70 ms, ultima accensione
 ```
 
 | Stato | ONCE: all'ingresso | ALWAYS: a ogni loop |
 | --- | --- | --- |
 | `PRE_GONFIAGGIO` | Ripristina la prova; accende la pompa | Dopo 2500 ms passa ad attesa arresto |
 | `ATTENDI_ARRESTO` | Spegne la pompa; avvia il timeout | Dopo 300 ms passa soltanto a `ATTENDI_FRONTE`, indipendentemente dai fronti |
-| `ATTENDI_FRONTE` | Mantiene la pompa spenta | Un nuovo fronte avvia un impulso |
-| `MOTOR_ON` | Corregge la durata; campiona tempo e contatore; accende la pompa | Conta i fronti senza prolungare il timer; alla scadenza torna ad attesa arresto |
+| `ATTENDI_FRONTE` | Mantiene la pompa spenta | Un nuovo fronte avvia una sequenza |
+| `MOTOR_ON` | Alla prima accensione prepara e corregge la sequenza; a ogni ingresso accende e stampa il log | Dopo 70 ms passa all'attesa del prossimo impulso, oppure ad attesa arresto se era l'ultimo |
+| `ATTENDI_IMPULSO` | Spegne la pompa | All'istante programmato avvia l'accensione successiva |
 | `FERMO` | Spegne la pompa | Aspetta il comando di riavvio |
 
 Una transizione esegue subito il ONCE del nuovo stato, nello stesso loop.
@@ -29,48 +33,77 @@ All'avvio il pregonfiaggio dura 2,5 secondi. Si passa poi a `ATTENDI_ARRESTO`
 per un'attesa fissa di 300 ms. I fronti non riavviano il timeout e non
 accendono la pompa: alla scadenza si entra soltanto in `ATTENDI_FRONTE`.
 Anche un fronte osservato nel loop che chiude l'attesa viene consumato;
-serve un nuovo fronte in `ATTENDI_FRONTE` per avviare il motore.
+serve un nuovo fronte in `ATTENDI_FRONTE` per avviare la sequenza.
 
-Il primo impulso ha durata 200 ms. I fronti arrivati durante un motor-on
-vengono contati, ma non riavviano il timer e non accodano impulsi. Alla
-scadenza la pompa si spegne e parte una nuova attesa fissa di 300 ms,
-misurata dallo spegnimento. I fronti accettati durante questa attesa
-restano nel conteggio usato dalla correzione del prossimo impulso.
+La prima sequenza emette una sola accensione da 70 ms: manca ancora un
+periodo `Dt` misurato. Il regolatore registra la base del confronto e
+mantiene la richiesta iniziale di 200 ms. Anche il primo avvio dopo il
+comando `a` segue questa regola.
 
-`ATTENDI_ARRESTO` e' quindi un'attesa temporizzata: il timeout non verifica
-che l'encoder sia fermo.
+## Distribuzione delle accensioni
 
-## Correzione della durata motor-on
-
-A ogni ingresso in `MOTOR_ON` si campionano il tempo corrente e il contatore
-encoder cumulativo. Dal secondo ingresso si calcolano sullo stesso intervallo:
+Dal secondo avvio si usa il periodo misurato tra gli inizi di due sequenze:
 
 ```text
-T = tempo motor-on attuale - tempo motor-on precedente
-n = contatore attuale - contatore al motor-on precedente
-obiettivo = n * 600 ms
-
-T > obiettivo  -> durata motor-on diminuisce di 20 ms
-T < obiettivo  -> durata motor-on aumenta di 20 ms
-T = obiettivo  -> durata motor-on invariata
+Dt = inizio sequenza attuale - inizio sequenza precedente
+N = max(1, tempo richiesto / IMPULSO_FISSO_MS)     [divisione intera]
+avvio dell'accensione k = inizio sequenza + floor(k * Dt / N)
+k = 0, 1, ..., N-1
 ```
 
-La durata resta tra **50 e 400 ms**. Questi sono limiti temporali modificabili
-nel sorgente. La correzione si esegue una volta all'ingresso di `MOTOR_ON`;
-la nuova durata viene usata subito per quell'impulso. La saturazione al
-minimo porta una riduzione da 60 ms a 50 ms, senza scendere a 40 ms.
+Esempio: con `Dt = 2000 ms`, richiesta di 300 ms e impulso fisso di 70 ms,
+si generano **4 accensioni**, agli istanti relativi **0, 500, 1000 e 1500 ms**.
+Ogni accensione dura 70 ms; la pausa fra queste accensioni e' di 430 ms.
+Il tempo totale acceso e' 280 ms: la divisione arrotonda per difetto e
+il resto non viene recuperato. Una richiesta sotto 70 ms produce comunque
+una singola accensione da 70 ms.
 
-`T` e' misurato tra gli avvii del motore, non tra i timestamp dei fronti.
-Il campione `n` include tutti i fronti accettati dal filtro dopo il campione
-del precedente motor-on, durante accensione e attesa, compreso il fronte che attiva il nuovo
-motor-on. Il fronte che aveva attivato l'accensione precedente e' gia' nel
-campione iniziale e non viene contato nuovamente. I fronti del pregonfiaggio
-non influenzano la correzione: il primo motor-on registra soltanto la base.
+Gli istanti vengono calcolati rispetto all'inizio della sequenza. Quando
+`Dt` non e' divisibile per `N`, le distanze differiscono al massimo di 1 ms:
+con `Dt = 2000 ms` e `N = 3`, gli avvii sono a 0, 666 e 1333 ms.
+Il prodotto `k * Dt` usa 64 bit per evitare overflow.
 
-Esempio: con 4 fronti tra due motor-on, il confronto e' con 2400 ms.
-Un periodo di 2401 ms porta la durata da 200 a 180 ms; 2399 ms la porta a
-220 ms; 2400 ms la lascia invariata. Contatore e `millis()` usano sottrazioni
-unsigned, per gestire il loro rollover.
+I fronti durante `MOTOR_ON` e `ATTENDI_IMPULSO` vengono contati per la
+correzione successiva; non interrompono, riavviano o accodano sequenze.
+Dopo l'ultima accensione la pompa si spegne, attende 300 ms fissi e poi
+aspetta un nuovo fronte. I fronti dell'attesa restano nel conteggio.
+`ATTENDI_ARRESTO` e' un'attesa temporizzata e non verifica che l'encoder sia fermo.
+
+Con parametri diversi, il numero di accensioni viene eventualmente ridotto
+per lasciare almeno 1 ms spento fra impulsi nel periodo misurato. Ogni
+accensione parte quando il loop osserva la scadenza e misura i suoi 70 ms
+dall'accensione effettiva. Se il loop e' in ritardo, le accensioni possono
+slittare e gli spegnimenti ritardare; non vengono eseguite transizioni
+spento/acceso nello stesso millisecondo per recuperare le scadenze arretrate.
+
+## Correzione del tempo richiesto
+
+Tempo e contatore vengono campionati una volta, alla prima accensione della
+sequenza. Le accensioni intermedie non cambiano questi campioni. Dal secondo
+avvio si calcolano sullo stesso intervallo:
+
+```text
+T = Dt
+n = contatore attuale - contatore all'inizio della sequenza precedente
+obiettivo = n * 600 ms
+
+T > obiettivo  -> tempo richiesto diminuisce di 20 ms
+T < obiettivo  -> tempo richiesto aumenta di 20 ms
+T = obiettivo  -> tempo richiesto invariato
+```
+
+La richiesta resta tra **50 e 400 ms**, con valore iniziale **200 ms**.
+Una riduzione da 60 a 50 ms vale -10 ms per rispettare il limite minimo.
+La nuova richiesta viene subito convertita nel numero di accensioni della
+sequenza. Con impulsi di 70 ms, una correzione di 20 ms puo' lasciare
+invariato il numero di accensioni finche' non si attraversa un multiplo di 70.
+
+`n` include tutti i fronti accettati dopo il campione della sequenza
+precedente, durante accensioni e attese, compreso quello che avvia la nuova
+sequenza. Il fronte che aveva avviato la precedente e' gia' nel campione
+iniziale e non viene contato nuovamente. I fronti del pregonfiaggio non
+influenzano la correzione. Contatore e `millis()` usano sottrazioni unsigned
+per gestire il loro rollover; l'obiettivo `n * 600` usa 64 bit.
 
 ## Parametri e struttura locale
 
@@ -81,12 +114,13 @@ I parametri sono all'inizio del `.ino`:
 | `DEBUG_PIN` | 12 / PE1 | Copia del livello grezzo dell'encoder |
 | `ENCODER_HOLDOFF_US` | 2000 | Tempo minimo fra fronti accettati |
 | `PRE_GONFIAGGIO_MS` | 2500 | Accensione iniziale |
-| `TIMEOUT_ARRESTO_MS` | 300 | Attesa fissa dopo lo spegnimento |
+| `TIMEOUT_ARRESTO_MS` | 300 | Attesa fissa dopo l'ultima accensione |
 | `MS_PER_FRONTE` | 600 | Tempo obiettivo per ciascun fronte |
-| `IMPULSO_INIZIALE_MS` | 200 | Primo motor-on di controllo |
-| `PASSO_MS` | 20 | Correzione della durata per intervallo |
-| `IMPULSO_MINIMO_MS` | 50 | Durata minima |
-| `IMPULSO_MASSIMO_MS` | 400 | Durata massima |
+| `IMPULSO_FISSO_MS` | 70 | Durata di ogni accensione di controllo, modificabile fra 1 e 400 ms |
+| `RICHIESTA_INIZIALE_MS` | 200 | Tempo totale richiesto iniziale |
+| `PASSO_MS` | 20 | Correzione della richiesta per sequenza |
+| `RICHIESTA_MINIMA_MS` | 50 | Richiesta minima |
+| `RICHIESTA_MASSIMA_MS` | 400 | Richiesta massima |
 
 ```text
 GIN/
@@ -150,41 +184,42 @@ Monitor seriale a **115200 baud**, con o senza terminazione di riga:
 | Comando | Effetto |
 | --- | --- |
 | `s` | Passa a `FERMO` e spegne la pompa nello stesso loop |
-| `a` | Da `FERMO`, riparte con pregonfiaggio e durata iniziale di 200 ms |
+| `a` | Da `FERMO`, riparte con pregonfiaggio e richiesta iniziale di 200 ms |
 
 `a` durante una prova attiva viene ignorato. Una nuova prova cancella i
 campioni della precedente. I timer degli stati usano `millis()` e il filtro
 encoder usa `micros()`, senza `delay()`.
 
-Il log stampa una stringa all'alimentazione o reset, poi una riga a ogni
-avvio di un impulso di controllo (`MOTOR_ON`). Esempio:
+Il log stampa `Avvio freno` all'alimentazione o reset, poi una riga a ogni
+accensione fisica di controllo. Esempio di una sequenza: richiesta di 300 ms distribuita
+su un periodo di 2000 ms, con correzione -20 ms all'inizio della sequenza:
 
 ```text
-Avvio freno
-Imp:200 Corr: +0 Dt:         0 Fr:         0
-Imp:180 Corr:-20 Dt:       601 Fr:         1
-Imp:200 Corr:+20 Dt:      1000 Fr:         3
+Imp: 70 Corr:-20 Dt:      2000 Fr:         1 Req:300 N:  1/  4
+Imp: 70 Corr: +0 Dt:      2000 Fr:         1 Req:300 N:  2/  4
+Imp: 70 Corr: +0 Dt:      2000 Fr:         1 Req:300 N:  3/  4
+Imp: 70 Corr: +0 Dt:      2000 Fr:         1 Req:300 N:  4/  4
 ```
 
-I campi sono nell'ordine impulso, correzione, tempo dal precedente impulso,
-fronti. `Imp`, `Corr` e `Dt` sono in millisecondi; `Fr` e' il numero di fronti.
-Le larghezze fisse sono 3, 3, 10 e 10 caratteri, con allineamento a destra
-e segno nella correzione. Ogni riga occupa 45 byte, incluso il newline.
+I primi campi restano nell'ordine impulso, correzione, tempo dal precedente
+avvio di sequenza, fronti. `Imp`, `Corr`, `Dt` e `Req` sono in millisecondi.
+`Imp` e' la durata fissa di ciascuna accensione; `Req` e' il tempo totale
+richiesto dal regolatore; `N` indica l'accensione attuale e il numero totale.
+Le colonne hanno larghezze fisse; ogni riga occupa 63 byte, incluso il newline.
 
-`Imp` e' la durata applicata all'impulso appena avviato; `Dt` e' il tempo
-tra gli avvii del motore, lo stesso usato dalla correzione. I fronti sono
-quelli accettati tra il precedente motor-on e quello attuale, incluso il
-fronte che avvia il nuovo impulso. La correzione indica la variazione
-effettiva della durata: da 60 a 50 ms vale `-10 ms`; ai limiti minimo o
-massimo vale `+0 ms` se la durata resta invariata.
+`Corr` mostra la variazione effettiva della richiesta, applicata solo alla
+prima accensione della sequenza; sulle successive vale 0. `Dt` e `Fr`
+descrivono l'ultimo intervallo completato fra gli inizi di due sequenze e
+restano uguali nelle righe di quella sequenza. Il conteggio in corso continua
+nell'ISR e sara' campionato all'inizio della sequenza successiva.
 
-Il primo impulso registra solo la base del confronto: tempo, fronti e
-correzione valgono 0. Anche il primo impulso dopo il comando `a` riparte cosi', senza
-ripetere la stringa di avvio. Il pregonfiaggio da 2500 ms non genera una
-riga impulso. Non ci sono messaggi periodici o di cambio stato.
+La prima sequenza stampa `Dt:0`, `Fr:0`, `Corr:+0`, `Req:200` e `N:1/1`,
+con spazi per allineare i campi. Anche dopo `a` riparte cosi', senza ripetere
+la stringa di avvio. Il pregonfiaggio da 2500 ms non genera righe impulso.
+Non ci sono messaggi periodici o di cambio stato.
 
-Ogni riga impulso viene inviata solo se entra interamente nel buffer UART;
-con spazio insufficiente viene saltata, senza accodarla o aspettare.
+Ogni riga viene inviata solo se entra interamente nel buffer UART; con
+spazio insufficiente viene saltata, senza accodarla o aspettare.
 Le stampe avvengono nel codice principale, fuori dall'ISR dell'encoder.
 
 ## Lettura atomica e verifiche
@@ -213,12 +248,13 @@ AVR GCC Debian 14.2.0, diverso da quello del pacchetto Arduino standard.
 Gli indici remoti e i tool di discovery non disponibili non impediscono
 la compilazione con il core locale. Il caricamento USB non e' verificato.
 
-I test verificano 17 gruppi: avvio/pin, copia debug e holdoff (inclusa la
-soglia esatta di 2 ms), rollover di `micros()`, ONCE, attesa fissa dopo il
-pregonfiaggio e dopo ogni impulso, correzione e conteggio, timestamp motor-on,
-moto continuo, minimo di 50 ms, massimo di 400 ms, stop/riavvio, rollover
-di `millis()` e del contatore, seriale congestionata, log di avvio e degli
-impulsi con correzione effettiva, spazio UART sufficiente per l'intera riga.
+I test verificano 20 gruppi: GPIO e prima sequenza, debug/holdoff,
+rollover di `micros()`, ONCE, attesa iniziale fissa, esempio 300/70 ms su
+2000 ms, conteggio dei fronti senza riavvio della sequenza, correzione,
+distribuzione con intervalli frazionari, timestamp effettivo di avvio,
+loop in ritardo, limiti della richiesta, stop/riavvio durante accensione
+e pausa, rollover di `millis()` e del contatore, periodi lunghi con prodotti
+a 64 bit, seriale congestionata, log di ogni accensione e spazio UART.
 
 ```sh
 set -e

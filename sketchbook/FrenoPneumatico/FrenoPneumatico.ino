@@ -10,25 +10,32 @@ constexpr uint32_t ENCODER_HOLDOFF_US = 2000;
 constexpr uint32_t PRE_GONFIAGGIO_MS = 2500;
 constexpr uint32_t TIMEOUT_ARRESTO_MS = 300;
 constexpr uint32_t MS_PER_FRONTE = 600;
-constexpr uint16_t IMPULSO_INIZIALE_MS = 200;
+constexpr uint16_t IMPULSO_FISSO_MS = 70;       // Durata di ogni accensione di controllo.
+constexpr uint16_t RICHIESTA_INIZIALE_MS = 200;
 constexpr uint16_t PASSO_MS = 20;
-constexpr uint16_t IMPULSO_MINIMO_MS = 50;
-constexpr uint16_t IMPULSO_MASSIMO_MS = 400;
+constexpr uint16_t RICHIESTA_MINIMA_MS = 50;
+constexpr uint16_t RICHIESTA_MASSIMA_MS = 400;
+static_assert(IMPULSO_FISSO_MS > 0 && IMPULSO_FISSO_MS <= RICHIESTA_MASSIMA_MS,
+              "IMPULSO_FISSO_MS deve essere tra 1 e RICHIESTA_MASSIMA_MS");
 
-enum Stato { PRE_GONFIAGGIO, ATTENDI_ARRESTO, ATTENDI_FRONTE, MOTOR_ON, FERMO };
+enum Stato { PRE_GONFIAGGIO, ATTENDI_ARRESTO, ATTENDI_FRONTE,
+             MOTOR_ON, ATTENDI_IMPULSO, FERMO };
 Stato stato = FERMO;
 bool ingressoStato = true;                     // true soltanto dopo una transizione.
 uint32_t inizioStatoMs = 0;
-uint16_t durataMotorOnMs = IMPULSO_INIZIALE_MS;
+uint16_t tempoRichiestoMs = RICHIESTA_INIZIALE_MS;
+uint32_t inizioSequenzaMs = 0;
+uint16_t numeroImpulsi = 1;
+uint16_t indiceImpulso = 0;                    // 0 = prima accensione della sequenza.
 
-// Campioni presi a ogni motor-on: tempo e contatore hanno gli stessi confini.
+// Campioni presi a ogni inizio sequenza: le accensioni intermedie non li cambiano.
 volatile uint32_t encoderTotale = 0;
 uint32_t ultimoFronteValidoUs = 0;              // Usato soltanto nell'ISR.
 bool fronteValidoRicevuto = false;             // Accetta anche il primo fronte a t=0.
 uint32_t totaleLetto = 0;
-bool precedenteMotorOnValido = false;
-uint32_t precedenteMotorOnMs = 0;
-uint32_t totaleAlMotorOn = 0;
+bool precedenteSequenzaValida = false;
+uint32_t precedenteSequenzaMs = 0;
+uint32_t totaleAllaSequenza = 0;
 uint32_t ultimoPeriodoMs = 0;
 uint32_t frontiPeriodo = 0;
 
@@ -53,12 +60,13 @@ uint32_t leggiEncoder() {
 
 void stampaImpulso(int16_t correzioneMs) {
   char riga[64];
-  // Tempi in ms. Campi fissi: impulso 3, correzione 3, periodo e fronti 10.
+  // Tempi in ms. Req = totale richiesto; N = accensione attuale / numero totale.
   const int lunghezza = snprintf(riga, sizeof(riga),
-                                "Imp:%3u Corr:%+3d Dt:%10lu Fr:%10lu\n",
-                                unsigned(durataMotorOnMs), int(correzioneMs),
+                                "Imp:%3u Corr:%+3d Dt:%10lu Fr:%10lu Req:%3u N:%3u/%3u\n",
+                                unsigned(IMPULSO_FISSO_MS), int(correzioneMs),
                                 (unsigned long)ultimoPeriodoMs,
-                                (unsigned long)frontiPeriodo);
+                                (unsigned long)frontiPeriodo, unsigned(tempoRichiestoMs),
+                                unsigned(indiceImpulso + 1), unsigned(numeroImpulsi));
   // Nessuna attesa per la UART: stampa solo se entra l'intera riga.
   if (lunghezza > 0 && lunghezza < int(sizeof(riga)) &&
       Serial.availableForWrite() >= lunghezza) Serial.print(riga);
@@ -70,23 +78,33 @@ void cambiaStato(Stato nuovoStato) {
   ingressoStato = true;
 }
 
-void correggiDurata(uint32_t now, uint32_t totale) {
-  if (precedenteMotorOnValido) {
-    ultimoPeriodoMs = uint32_t(now - precedenteMotorOnMs);
-    frontiPeriodo = uint32_t(totale - totaleAlMotorOn);
+void preparaSequenza(uint32_t now, uint32_t totale) {
+  if (precedenteSequenzaValida) {
+    ultimoPeriodoMs = uint32_t(now - precedenteSequenzaMs);
+    frontiPeriodo = uint32_t(totale - totaleAllaSequenza);
     const uint64_t tempoObiettivoMs = uint64_t(frontiPeriodo) * MS_PER_FRONTE;
 
     // Lento: meno gonfiaggio. Rapido: piu' gonfiaggio. Uguale: nessuna modifica.
-    int32_t nuovaDurataMs = durataMotorOnMs;
-    if (ultimoPeriodoMs > tempoObiettivoMs) nuovaDurataMs -= PASSO_MS;
-    else if (ultimoPeriodoMs < tempoObiettivoMs) nuovaDurataMs += PASSO_MS;
-    if (nuovaDurataMs < IMPULSO_MINIMO_MS) nuovaDurataMs = IMPULSO_MINIMO_MS;
-    if (nuovaDurataMs > IMPULSO_MASSIMO_MS) nuovaDurataMs = IMPULSO_MASSIMO_MS;
-    durataMotorOnMs = uint16_t(nuovaDurataMs);
+    int32_t nuovaRichiestaMs = tempoRichiestoMs;
+    if (ultimoPeriodoMs > tempoObiettivoMs) nuovaRichiestaMs -= PASSO_MS;
+    else if (ultimoPeriodoMs < tempoObiettivoMs) nuovaRichiestaMs += PASSO_MS;
+    if (nuovaRichiestaMs < RICHIESTA_MINIMA_MS) nuovaRichiestaMs = RICHIESTA_MINIMA_MS;
+    if (nuovaRichiestaMs > RICHIESTA_MASSIMA_MS) nuovaRichiestaMs = RICHIESTA_MASSIMA_MS;
+    tempoRichiestoMs = uint16_t(nuovaRichiestaMs);
   }
-  precedenteMotorOnMs = now;
-  totaleAlMotorOn = totale;
-  precedenteMotorOnValido = true;
+  precedenteSequenzaMs = inizioSequenzaMs = now;
+  totaleAllaSequenza = totale;
+  precedenteSequenzaValida = true;
+
+  // Arrotonda per difetto; garantisce almeno un'accensione.
+  numeroImpulsi = tempoRichiestoMs / IMPULSO_FISSO_MS;
+  if (numeroImpulsi == 0) numeroImpulsi = 1;
+  if (ultimoPeriodoMs == 0) numeroImpulsi = 1; // Prima sequenza: manca ancora Dt.
+  else {
+    // Con altri parametri evita sovrapposizioni: almeno 1 ms spento fra accensioni.
+    const uint32_t capienza = ultimoPeriodoMs / (uint32_t(IMPULSO_FISSO_MS) + 1);
+    if (numeroImpulsi > capienza) numeroImpulsi = capienza > 0 ? uint16_t(capienza) : 1;
+  }
 }
 
 void aggiornaFreno(uint32_t now, uint32_t totale) {
@@ -101,9 +119,12 @@ void aggiornaFreno(uint32_t now, uint32_t totale) {
     switch (stato) {
       case PRE_GONFIAGGIO:
         if (once) {                            // ONCE: prepara una nuova prova.
-          durataMotorOnMs = IMPULSO_INIZIALE_MS;
-          precedenteMotorOnValido = false;
+          tempoRichiestoMs = RICHIESTA_INIZIALE_MS;
+          precedenteSequenzaValida = false;
           ultimoPeriodoMs = frontiPeriodo = 0;
+          indiceImpulso = 0;
+          numeroImpulsi = 1;
+          inizioSequenzaMs = 0;
           inizioStatoMs = now;
           digitalWrite(MOTOR_PIN, HIGH);
         }
@@ -132,26 +153,46 @@ void aggiornaFreno(uint32_t now, uint32_t totale) {
         if (once) {                            // ONCE: lascia il motore spento.
           digitalWrite(MOTOR_PIN, LOW);
         }
-        // ALWAYS: un nuovo fronte avvia un impulso.
+        // ALWAYS: un nuovo fronte avvia una sequenza.
         if (nuovoFronte) {
+          indiceImpulso = 0;
           cambiaStato(MOTOR_ON);
           continue;
         }
         break;
 
       case MOTOR_ON:
-        if (once) {                            // ONCE: correggi e accendi una volta.
-          const uint16_t durataPrecedenteMs = durataMotorOnMs;
-          correggiDurata(now, totale);
+        if (once) {                            // ONCE: accendi per la durata fissa.
+          int16_t correzioneMs = 0;
+          if (indiceImpulso == 0) {            // Correzione solo all'inizio sequenza.
+            const uint16_t richiestaPrecedenteMs = tempoRichiestoMs;
+            preparaSequenza(now, totale);
+            correzioneMs = int16_t(tempoRichiestoMs) - int16_t(richiestaPrecedenteMs);
+          }
           inizioStatoMs = now;
           digitalWrite(MOTOR_PIN, HIGH);
-          // Mostra la correzione effettiva, inclusi i limiti di 50 e 400 ms.
-          stampaImpulso(int16_t(durataMotorOnMs) - int16_t(durataPrecedenteMs));
+          stampaImpulso(correzioneMs);
         }
         // ALWAYS: i fronti si contano, senza riavviare il timer del motore.
         nuovoFronte = false;
-        if (uint32_t(now - inizioStatoMs) >= durataMotorOnMs) {
-          cambiaStato(ATTENDI_ARRESTO);
+        if (uint32_t(now - inizioStatoMs) >= IMPULSO_FISSO_MS) {
+          ++indiceImpulso;
+          cambiaStato(indiceImpulso < numeroImpulsi ? ATTENDI_IMPULSO : ATTENDI_ARRESTO);
+          continue;
+        }
+        break;
+
+      case ATTENDI_IMPULSO:
+        if (once) {                            // ONCE: spegni fra due accensioni.
+          digitalWrite(MOTOR_PIN, LOW);
+          inizioStatoMs = now;
+        }
+        // ALWAYS: avvii a 0, Dt/N, 2*Dt/N... senza accumulare gli arrotondamenti.
+        // Il prodotto a 64 bit evita overflow anche con Dt molto lungo.
+        if (uint32_t(now - inizioSequenzaMs) >=
+              uint64_t(indiceImpulso) * ultimoPeriodoMs / numeroImpulsi &&
+            uint32_t(now - inizioStatoMs) > 0) {
+          cambiaStato(MOTOR_ON);
           continue;
         }
         break;
