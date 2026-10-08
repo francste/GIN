@@ -10,6 +10,14 @@
 constexpr uint8_t A0 = 14;
 constexpr int LOW = 0, HIGH = 1, INPUT = 0, OUTPUT = 1, INPUT_PULLUP = 2, CHANGE = 3;
 
+// Registri usati per i due ingressi fisici fuori dalla mappatura Arduino.
+constexpr uint8_t PIN6_bm = 0x40;
+struct MockPort {
+  uint8_t DIRCLR = 0;
+  uint8_t PIN6CTRL = 0;
+};
+extern MockPort PORTA, PORTD;
+
 namespace hardware {
   extern uint64_t timeUs;
   extern int levels[24], modes[24], writes[24];

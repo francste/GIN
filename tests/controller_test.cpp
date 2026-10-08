@@ -9,6 +9,7 @@ namespace hardware {
   void (*interrupt)() = nullptr;
   int interruptPin = -1, interruptMode = -1;
 }
+MockPort PORTA, PORTD;
 MockSerial Serial;
 
 static void at(uint64_t ms) { hardware::timeUs = ms * 1000; }
@@ -22,6 +23,7 @@ static void edgeUs(uint64_t us, bool runLoop = true) {
 static void edge(uint64_t ms, bool runLoop = true) { edgeUs(ms * 1000, runLoop); }
 
 static void reset(uint64_t startMs = 0) {
+  PORTA = PORTD = MockPort();
   Serial = MockSerial();
   for (int i = 0; i < 24; ++i) {
     hardware::levels[i] = hardware::modes[i] = hardware::writes[i] = 0;

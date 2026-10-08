@@ -195,6 +195,9 @@ void stampaStato(uint32_t now) {
 }
 
 void setup() {
+  // Ingressi fisici fuori dalla mappatura Arduino: buffer attivo, senza pull-up o interrupt.
+  PORTD.DIRCLR = PIN6_bm; PORTD.PIN6CTRL = 0;  // PD6.
+  PORTA.DIRCLR = PIN6_bm; PORTA.PIN6CTRL = 0;  // PA6.
   digitalWrite(MOTOR_PIN, LOW); pinMode(MOTOR_PIN, OUTPUT);
   digitalWrite(11, HIGH); pinMode(11, OUTPUT);
   digitalWrite(6, HIGH); pinMode(6, OUTPUT);

@@ -118,6 +118,14 @@ scegliere **Arduino Nano Every** e **Registers emulation: None (ATMEGA4809)**.
 | Comando pompa | D3 | HIGH acceso, LOW spento |
 | Encoder | D14 / A0 | INPUT, senza pull-up interno, interrupt CHANGE |
 | Debug encoder | D12 / PE1 | OUTPUT, copia del livello encoder a ogni interrupt |
+| Ingresso aggiuntivo | PD6 | INPUT, buffer digitale attivo, senza pull-up o interrupt |
+| Ingresso aggiuntivo | PA6 | INPUT, buffer digitale attivo, senza pull-up o interrupt |
+
+PD6 e PA6 vengono configurati direttamente in `setup()` tramite i registri
+`PORTD` e `PORTA`, anche se non hanno un numero nella variante Arduino Nano
+Every. `DIRCLR = PIN6_bm` imposta il solo bit 6 come ingresso;
+`PIN6CTRL = 0` attiva il buffer digitale e disabilita pull-up e interrupt
+del pin. La configurazione vale sia per ATmega3209 sia per ATmega4809.
 
 L'ISR copia subito il livello letto su A0 nell'uscita PE1, prima del filtro:
 il debug mostra anche i rimbalzi. Il primo fronte viene accettato; dopo
