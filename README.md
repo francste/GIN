@@ -11,34 +11,34 @@ sua durata vengono impostati solo nel ONCE di `MOTOR_ON`.
 stateDiagram-v2
     [*] --> PRE_GONFIAGGIO
     PRE_GONFIAGGIO --> ATTENDI_ARRESTO: 2500 ms
-    ATTENDI_ARRESTO --> MOTOR_ON: nuovo fronte
-    ATTENDI_ARRESTO --> ATTENDI_PRIMO_FRONTE: 300 ms senza fronti
-    ATTENDI_PRIMO_FRONTE --> MOTOR_ON: primo fronte
+    ATTENDI_ARRESTO --> ATTENDI_FRONTE: 300 ms fissi
+    ATTENDI_FRONTE --> MOTOR_ON: nuovo fronte
     MOTOR_ON --> ATTENDI_ARRESTO: fine impulso
 ```
 
 | Stato | ONCE: all'ingresso | ALWAYS: a ogni loop |
 | --- | --- | --- |
 | `PRE_GONFIAGGIO` | Ripristina la prova; accende la pompa | Dopo 2500 ms passa ad attesa arresto |
-| `ATTENDI_ARRESTO` | Spegne la pompa; avvia il timeout | Un fronte avvia un impulso; 300 ms senza fronti confermano l'arresto |
-| `ATTENDI_PRIMO_FRONTE` | Mantiene la pompa spenta | Aspetta il primo fronte dopo l'arresto |
+| `ATTENDI_ARRESTO` | Spegne la pompa; avvia il timeout | Dopo 300 ms passa soltanto a `ATTENDI_FRONTE`, indipendentemente dai fronti |
+| `ATTENDI_FRONTE` | Mantiene la pompa spenta | Un nuovo fronte avvia un impulso |
 | `MOTOR_ON` | Corregge la durata; campiona tempo e contatore; accende la pompa | Conta i fronti senza prolungare il timer; alla scadenza torna ad attesa arresto |
 | `FERMO` | Spegne la pompa | Aspetta il comando di riavvio |
 
 Una transizione esegue subito il ONCE del nuovo stato, nello stesso loop.
-All'avvio il pregonfiaggio dura 2,5 secondi. Si passa poi a `ATTENDI_ARRESTO`,
-anche se non sono arrivati fronti, per osservare un intero timeout di silenzio.
+All'avvio il pregonfiaggio dura 2,5 secondi. Si passa poi a `ATTENDI_ARRESTO`
+per un'attesa fissa di 300 ms. I fronti non riavviano il timeout e non
+accendono la pompa: alla scadenza si entra soltanto in `ATTENDI_FRONTE`.
+Anche un fronte osservato nel loop che chiude l'attesa viene consumato;
+serve un nuovo fronte in `ATTENDI_FRONTE` per avviare il motore.
 
-Ogni fronte rilevato in `ATTENDI_ARRESTO` fa entrare in `MOTOR_ON`: possono
-quindi esserci piu' impulsi prima dell'arresto. I fronti arrivati durante un
-motor-on vengono contati, ma non riavviano il timer e non accodano impulsi.
-Il primo impulso ha durata 200 ms. Alla sua scadenza la pompa si spegne e
-parte una nuova attesa di 300 ms senza fronti, misurata dallo spegnimento.
-Quando scade il timeout, il controllo aspetta il primo fronte del nuovo scatto.
+Il primo impulso ha durata 200 ms. I fronti arrivati durante un motor-on
+vengono contati, ma non riavviano il timer e non accodano impulsi. Alla
+scadenza la pompa si spegne e parte una nuova attesa fissa di 300 ms,
+misurata dallo spegnimento. I fronti accettati durante questa attesa
+restano nel conteggio usato dalla correzione del prossimo impulso.
 
-Il blocco e' **presunto dal silenzio dell'encoder**. Il timeout di 300 ms e'
-una scelta iniziale da verificare sulla meccanica; non misura la pressione
-ne' uno spostamento piu' piccolo della risoluzione dell'encoder.
+`ATTENDI_ARRESTO` e' quindi un'attesa temporizzata: il timeout non verifica
+che l'encoder sia fermo.
 
 ## Correzione della durata motor-on
 
@@ -55,13 +55,14 @@ T < obiettivo  -> durata motor-on aumenta di 20 ms
 T = obiettivo  -> durata motor-on invariata
 ```
 
-La durata resta tra **20 e 400 ms**. Questi sono limiti temporali modificabili
+La durata resta tra **50 e 400 ms**. Questi sono limiti temporali modificabili
 nel sorgente. La correzione si esegue una volta all'ingresso di `MOTOR_ON`;
-la nuova durata viene usata subito per quell'impulso.
+la nuova durata viene usata subito per quell'impulso. La saturazione al
+minimo porta una riduzione da 60 ms a 50 ms, senza scendere a 40 ms.
 
 `T` e' misurato tra gli avvii del motore, non tra i timestamp dei fronti.
-Il campione `n` include tutti i fronti successivi al campione del precedente
-motor-on, durante accensione e attesa, compreso il fronte che attiva il nuovo
+Il campione `n` include tutti i fronti accettati dal filtro dopo il campione
+del precedente motor-on, durante accensione e attesa, compreso il fronte che attiva il nuovo
 motor-on. Il fronte che aveva attivato l'accensione precedente e' gia' nel
 campione iniziale e non viene contato nuovamente. I fronti del pregonfiaggio
 non influenzano la correzione: il primo motor-on registra soltanto la base.
@@ -77,12 +78,14 @@ I parametri sono all'inizio del `.ino`:
 
 | Parametro | Valore iniziale | Significato |
 | --- | --- | --- |
+| `DEBUG_PIN` | 12 / PE1 | Copia del livello grezzo dell'encoder |
+| `ENCODER_HOLDOFF_US` | 2000 | Tempo minimo fra fronti accettati |
 | `PRE_GONFIAGGIO_MS` | 2500 | Accensione iniziale |
-| `TIMEOUT_ARRESTO_MS` | 300 | Silenzio dopo lo spegnimento per arresto presunto |
+| `TIMEOUT_ARRESTO_MS` | 300 | Attesa fissa dopo lo spegnimento |
 | `MS_PER_FRONTE` | 600 | Tempo obiettivo per ciascun fronte |
 | `IMPULSO_INIZIALE_MS` | 200 | Primo motor-on di controllo |
 | `PASSO_MS` | 20 | Correzione della durata per intervallo |
-| `IMPULSO_MINIMO_MS` | 20 | Durata minima |
+| `IMPULSO_MINIMO_MS` | 50 | Durata minima |
 | `IMPULSO_MASSIMO_MS` | 400 | Durata massima |
 
 ```text
@@ -114,8 +117,17 @@ scegliere **Arduino Nano Every** e **Registers emulation: None (ATMEGA4809)**.
 | Preimpostazione | D4 | LOW |
 | Comando pompa | D3 | HIGH acceso, LOW spento |
 | Encoder | D14 / A0 | INPUT, senza pull-up interno, interrupt CHANGE |
+| Debug encoder | D12 / PE1 | OUTPUT, copia del livello encoder a ogni interrupt |
 
-Si contano salita e discesa: un impulso completo alto/basso vale due fronti.
+L'ISR copia subito il livello letto su A0 nell'uscita PE1, prima del filtro:
+il debug mostra anche i rimbalzi. Il primo fronte viene accettato; dopo
+ciascun fronte accettato, quelli a meno di 2 ms vengono scartati dal contatore.
+A 2 ms esatti un fronte e' nuovamente valido. I rimbalzi scartati non
+prolungano il holdoff. Il filtro usa `micros()` e gestisce il suo rollover.
+
+Si contano salita e discesa: un impulso completo alto/basso vale due fronti
+se entrambi passano il filtro. Anche fronti reali distanziati meno di 2 ms
+vengono scartati dal conteggio.
 L'encoder deve fornire livelli definiti e compatibili, con massa comune alla
 scheda. D3 comanda lo stadio di potenza del motore.
 
@@ -128,7 +140,8 @@ Monitor seriale a **115200 baud**, con o senza terminazione di riga:
 | `a` | Da `FERMO`, riparte con pregonfiaggio e durata iniziale di 200 ms |
 
 `a` durante una prova attiva viene ignorato. Una nuova prova cancella i
-campioni della precedente. Le operazioni usano `millis()`, senza `delay()`.
+campioni della precedente. I timer degli stati usano `millis()` e il filtro
+encoder usa `micros()`, senza `delay()`.
 
 Il log, una riga al secondo se il buffer ha spazio, e':
 
@@ -136,14 +149,15 @@ Il log, una riga al secondo se il buffer ha spazio, e':
 S,stato,P,durata_motor_on_ms,N,fronti_periodo,T,periodo_ms
 ```
 
-Stati: 0=pregonfiaggio, 1=attesa arresto, 2=attesa primo fronte,
+Stati: 0=pregonfiaggio, 1=attesa arresto, 2=attesa fronte,
 3=motor-on, 4=fermo. `N` e `T` descrivono lo stesso ultimo intervallo completato
 tra due motor-on; valgono 0 fino al secondo motor-on. `P` e' la durata corretta
 dell'impulso di controllo, anche durante il pregonfiaggio da 2500 ms.
 
 ## Lettura atomica e verifiche
 
-L'interrupt incrementa soltanto `encoderTotale`. La lettura usa
+L'interrupt aggiorna PE1 e incrementa `encoderTotale` solo per fronti
+accettati dal holdoff. La lettura del contatore usa
 `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)` della toolchain AVR: protegge la copia
 a 32 bit sul microcontrollore a 8 bit e ripristina lo stato degli interrupt.
 `tests/mock/util/atomic.h` e `tests/mock/Arduino.h` servono solo ai test PC,
@@ -166,10 +180,11 @@ AVR GCC Debian 14.2.0, diverso da quello del pacchetto Arduino standard.
 Gli indici remoti e i tool di discovery non disponibili non impediscono
 la compilazione con il core locale. Il caricamento USB non e' verificato.
 
-I test verificano 13 gruppi: avvio/pin, ONCE, movimento dopo pregonfiaggio,
-nuovi impulsi durante l'attesa, correzione e conteggio, timestamp motor-on,
-moto continuo, minimo, massimo, stop/riavvio, rollover del tempo e del
-contatore, seriale congestionata.
+I test verificano 15 gruppi: avvio/pin, copia debug e holdoff (inclusa la
+soglia esatta di 2 ms), rollover di `micros()`, ONCE, attesa fissa dopo il
+pregonfiaggio e dopo ogni impulso, correzione e conteggio, timestamp motor-on,
+moto continuo, minimo di 50 ms, massimo di 400 ms, stop/riavvio, rollover
+di `millis()` e del contatore, seriale congestionata.
 
 ```sh
 set -e

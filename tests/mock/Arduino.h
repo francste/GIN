@@ -18,6 +18,7 @@ namespace hardware {
 }
 inline uint32_t micros() { return uint32_t(hardware::timeUs); }
 inline uint32_t millis() { return uint32_t(hardware::timeUs / 1000); }
+inline int digitalRead(uint8_t pin) { return hardware::levels[pin]; }
 inline void digitalWrite(uint8_t pin, int level) {
   hardware::levels[pin] = level;
   ++hardware::writes[pin];

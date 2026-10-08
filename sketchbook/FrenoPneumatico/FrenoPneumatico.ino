@@ -5,15 +5,17 @@
 // Parametri della prima prova.
 constexpr uint8_t MOTOR_PIN = 3;
 constexpr uint8_t ENCODER_PIN = A0;             // D14, senza pull-up interno.
+constexpr uint8_t DEBUG_PIN = 12;               // PE1 sul Nano Every.
+constexpr uint32_t ENCODER_HOLDOFF_US = 2000;
 constexpr uint32_t PRE_GONFIAGGIO_MS = 2500;
 constexpr uint32_t TIMEOUT_ARRESTO_MS = 300;
 constexpr uint32_t MS_PER_FRONTE = 600;
 constexpr uint16_t IMPULSO_INIZIALE_MS = 200;
 constexpr uint16_t PASSO_MS = 20;
-constexpr uint16_t IMPULSO_MINIMO_MS = 20;
+constexpr uint16_t IMPULSO_MINIMO_MS = 50;
 constexpr uint16_t IMPULSO_MASSIMO_MS = 400;
 
-enum Stato { PRE_GONFIAGGIO, ATTENDI_ARRESTO, ATTENDI_PRIMO_FRONTE, MOTOR_ON, FERMO };
+enum Stato { PRE_GONFIAGGIO, ATTENDI_ARRESTO, ATTENDI_FRONTE, MOTOR_ON, FERMO };
 Stato stato = FERMO;
 bool ingressoStato = true;                     // true soltanto dopo una transizione.
 uint32_t inizioStatoMs = 0;
@@ -21,6 +23,8 @@ uint16_t durataMotorOnMs = IMPULSO_INIZIALE_MS;
 
 // Campioni presi a ogni motor-on: tempo e contatore hanno gli stessi confini.
 volatile uint32_t encoderTotale = 0;
+uint32_t ultimoFronteValidoUs = 0;              // Usato soltanto nell'ISR.
+bool fronteValidoRicevuto = false;             // Accetta anche il primo fronte a t=0.
 uint32_t totaleLetto = 0;
 bool precedenteMotorOnValido = false;
 uint32_t precedenteMotorOnMs = 0;
@@ -30,6 +34,14 @@ uint32_t frontiPeriodo = 0;
 uint32_t ultimoLogMs = 0;
 
 void encoderISR() {
+  // Copia il livello grezzo: sul debug si vedono anche i rimbalzi scartati.
+  digitalWrite(DEBUG_PIN, digitalRead(ENCODER_PIN));
+  const uint32_t nowUs = micros();
+  if (fronteValidoRicevuto &&
+      uint32_t(nowUs - ultimoFronteValidoUs) < ENCODER_HOLDOFF_US) return;
+  // Il holdoff parte dal fronte accettato; i rimbalzi non lo prolungano.
+  ultimoFronteValidoUs = nowUs;
+  fronteValidoRicevuto = true;
   ++encoderTotale;                             // CHANGE: conta salita e discesa.
 }
 
@@ -96,22 +108,19 @@ void aggiornaFreno(uint32_t now, uint32_t totale) {
           digitalWrite(MOTOR_PIN, LOW);
           inizioStatoMs = now;
         }
-        // ALWAYS: se scatta, frena; altrimenti conferma l'arresto col timeout.
-        if (nuovoFronte) {
-          cambiaStato(MOTOR_ON);
-          continue;
-        }
+        // ALWAYS: attesa fissa di 300 ms, indipendente dai fronti.
         if (uint32_t(now - inizioStatoMs) >= TIMEOUT_ARRESTO_MS) {
-          cambiaStato(ATTENDI_PRIMO_FRONTE);
+          nuovoFronte = false;                 // Non riusa fronti osservati in questa attesa.
+          cambiaStato(ATTENDI_FRONTE);
           continue;
         }
         break;
 
-      case ATTENDI_PRIMO_FRONTE:
+      case ATTENDI_FRONTE:
         if (once) {                            // ONCE: lascia il motore spento.
           digitalWrite(MOTOR_PIN, LOW);
         }
-        // ALWAYS: il primo fronte dopo l'arresto avvia un impulso.
+        // ALWAYS: un nuovo fronte avvia un impulso.
         if (nuovoFronte) {
           cambiaStato(MOTOR_ON);
           continue;
@@ -122,7 +131,7 @@ void aggiornaFreno(uint32_t now, uint32_t totale) {
         if (once) {                            // ONCE: correggi e accendi una volta.
           correggiDurata(now, totale);
           inizioStatoMs = now;
-          digitalWrite(MOTOR_PIN, durataMotorOnMs != 0 ? HIGH : LOW);
+          digitalWrite(MOTOR_PIN, HIGH);
         }
         // ALWAYS: i fronti si contano, senza riavviare il timer del motore.
         nuovoFronte = false;
@@ -168,6 +177,8 @@ void setup() {
   digitalWrite(6, HIGH); pinMode(6, OUTPUT);
   digitalWrite(4, LOW); pinMode(4, OUTPUT);
   digitalWrite(ENCODER_PIN, LOW); pinMode(ENCODER_PIN, INPUT);
+  digitalWrite(DEBUG_PIN, LOW); pinMode(DEBUG_PIN, OUTPUT);
+  digitalWrite(DEBUG_PIN, digitalRead(ENCODER_PIN));
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, CHANGE);
   Serial.begin(115200);
   cambiaStato(PRE_GONFIAGGIO);

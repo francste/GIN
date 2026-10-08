@@ -13,12 +13,13 @@ MockSerial Serial;
 
 static void at(uint64_t ms) { hardware::timeUs = ms * 1000; }
 static void tick(uint64_t ms) { at(ms); loop(); }
-static void edge(uint64_t ms, bool runLoop = true) {
-  at(ms);
+static void edgeUs(uint64_t us, bool runLoop = true) {
+  hardware::timeUs = us;
   hardware::levels[A0] ^= 1;
   hardware::interrupt();
   if (runLoop) loop();
 }
+static void edge(uint64_t ms, bool runLoop = true) { edgeUs(ms * 1000, runLoop); }
 
 static void reset(uint64_t startMs = 0) {
   Serial = MockSerial();
@@ -29,6 +30,7 @@ static void reset(uint64_t startMs = 0) {
   hardware::interruptPin = hardware::interruptMode = -1;
   stato = FERMO; ingressoStato = true;
   encoderTotale = totaleLetto = 0;
+  ultimoFronteValidoUs = 0; fronteValidoRicevuto = false;
   precedenteMotorOnMs = totaleAlMotorOn = ultimoLogMs = 0;
   at(startMs); setup();
 }
@@ -43,14 +45,14 @@ static void finishPreinflation(uint64_t startMs = 0) {
 static void ready(uint64_t startMs = 0) {
   finishPreinflation(startMs);
   tick(startMs + 2799); assert(stato == ATTENDI_ARRESTO);
-  tick(startMs + 2800); assert(stato == ATTENDI_PRIMO_FRONTE);
+  tick(startMs + 2800); assert(stato == ATTENDI_FRONTE);
 }
 
 static void three_edges_between_motor_starts() {
   reset(); ready(); edge(3000);
   edge(3050); edge(3100); edge(3150);
   tick(3200); tick(3500);
-  assert(stato == ATTENDI_PRIMO_FRONTE);
+  assert(stato == ATTENDI_FRONTE);
 }
 
 static void startup_and_input_without_pullup() {
@@ -58,12 +60,40 @@ static void startup_and_input_without_pullup() {
   assert(hardware::levels[11] == HIGH && hardware::levels[6] == HIGH);
   assert(hardware::levels[4] == LOW && hardware::levels[3] == HIGH);
   assert(hardware::modes[A0] == INPUT && hardware::levels[A0] == LOW);
+  assert(DEBUG_PIN == 12 && hardware::modes[12] == OUTPUT && hardware::levels[12] == LOW);
   assert(hardware::interruptPin == 14 && hardware::interruptMode == CHANGE);
   edge(1000, false); edge(1000, false); tick(1000);
-  assert(encoderTotale == 2 && !precedenteMotorOnValido);
+  assert(encoderTotale == 1 && !precedenteMotorOnValido);
+  assert(hardware::levels[12] == hardware::levels[A0]);
   ready(); edge(3000);
   assert(durataMotorOnMs == 200 && frontiPeriodo == 0 && ultimoPeriodoMs == 0);
-  assert(totaleAlMotorOn == 3);               // Esclude il pregonfiaggio dai confronti.
+  assert(totaleAlMotorOn == 2);               // Esclude il pregonfiaggio dai confronti.
+}
+
+static void debug_mirrors_raw_edges_and_holdoff_is_fixed() {
+  reset();
+  edgeUs(0, false);                          // Primo fronte valido anche a t=0.
+  assert(encoderTotale == 1 && hardware::levels[12] == HIGH);
+  edgeUs(1, false);
+  assert(encoderTotale == 1 && hardware::levels[12] == LOW);
+  edgeUs(1999, false);
+  assert(encoderTotale == 1 && hardware::levels[12] == HIGH);
+  edgeUs(2000, false);                       // Il rimbalzo a 1999 us non prolunga il filtro.
+  assert(encoderTotale == 2 && hardware::levels[12] == LOW);
+  edgeUs(3999, false);
+  assert(encoderTotale == 2 && hardware::levels[12] == HIGH);
+  edgeUs(4000, false);
+  assert(encoderTotale == 3 && hardware::levels[12] == LOW);
+}
+
+static void encoder_holdoff_micros_rollover() {
+  reset();
+  const uint64_t firstUs = uint64_t(UINT32_MAX) - 1000;
+  edgeUs(firstUs, false);
+  edgeUs(firstUs + 1999, false);
+  assert(encoderTotale == 1 && hardware::levels[12] == LOW);
+  edgeUs(firstUs + 2000, false);
+  assert(encoderTotale == 2 && hardware::levels[12] == HIGH);
 }
 
 static void once_runs_only_on_state_entry() {
@@ -91,27 +121,34 @@ static void once_runs_only_on_state_entry() {
 static void movement_while_waiting_for_initial_stop() {
   reset(); finishPreinflation();
   tick(2599); edge(2600);
-  assert(stato == MOTOR_ON && hardware::levels[3] == HIGH);
-  assert(durataMotorOnMs == 200 && precedenteMotorOnMs == 2600);
-  tick(2799); assert(hardware::levels[3] == HIGH);
-  tick(2800); assert(stato == ATTENDI_ARRESTO && hardware::levels[3] == LOW);
-  tick(3099); assert(stato == ATTENDI_ARRESTO);
-  tick(3100); assert(stato == ATTENDI_PRIMO_FRONTE);
+  edge(2798);
+  assert(stato == ATTENDI_ARRESTO && hardware::levels[3] == LOW);
+  assert(inizioStatoMs == 2500 && !precedenteMotorOnValido);
+  edge(2800);                               // Anche il fronte alla scadenza resta nell'attesa.
+  assert(stato == ATTENDI_FRONTE && hardware::levels[3] == LOW);
+  tick(2801);
+  assert(stato == ATTENDI_FRONTE && !precedenteMotorOnValido);
+  edge(2802);
+  assert(stato == MOTOR_ON && durataMotorOnMs == 200);
+  assert(precedenteMotorOnMs == 2802 && totaleAlMotorOn == 4);
 }
 
-static void movement_repeats_pulse_before_quiet_timeout() {
+static void fixed_wait_ignores_edges_but_keeps_them_in_correction() {
   reset(); ready(); edge(3000);
   edge(3050); edge(3100); tick(3199);
   assert(hardware::levels[3] == HIGH);
   tick(3200); assert(stato == ATTENDI_ARRESTO && hardware::levels[3] == LOW);
-  edge(3300);
+  edge(3300); edge(3498);
+  assert(stato == ATTENDI_ARRESTO && hardware::levels[3] == LOW);
+  assert(inizioStatoMs == 3200 && precedenteMotorOnMs == 3000);
+  edge(3500);
+  assert(stato == ATTENDI_FRONTE && hardware::levels[3] == LOW);
+  tick(3501); assert(stato == ATTENDI_FRONTE);
+  edge(3502);
   assert(stato == MOTOR_ON && hardware::levels[3] == HIGH);
-  assert(ultimoPeriodoMs == 300 && frontiPeriodo == 3 && durataMotorOnMs == 220);
-  tick(3520); edge(3600);
-  assert(stato == MOTOR_ON && ultimoPeriodoMs == 300 && frontiPeriodo == 1);
-  assert(durataMotorOnMs == 240);
-  tick(3840); tick(4139); assert(stato == ATTENDI_ARRESTO);
-  tick(4140); assert(stato == ATTENDI_PRIMO_FRONTE && hardware::levels[3] == LOW);
+  assert(ultimoPeriodoMs == 502 && frontiPeriodo == 6 && durataMotorOnMs == 220);
+  tick(3722); tick(4021); assert(stato == ATTENDI_ARRESTO);
+  tick(4022); assert(stato == ATTENDI_FRONTE && hardware::levels[3] == LOW);
 }
 
 static void correction_uses_same_time_and_counter_window() {
@@ -137,7 +174,7 @@ static void delayed_loop_measures_actual_motor_on_time() {
   assert(precedenteMotorOnMs == 3050 && totaleAlMotorOn == 3);
   tick(3249); assert(hardware::levels[3] == HIGH);
   tick(3250); assert(hardware::levels[3] == LOW);
-  tick(3550); assert(stato == ATTENDI_PRIMO_FRONTE);
+  tick(3550); assert(stato == ATTENDI_FRONTE);
   edge(3650, false); tick(3651);
   assert(ultimoPeriodoMs == 601 && frontiPeriodo == 1 && durataMotorOnMs == 180);
 }
@@ -146,7 +183,7 @@ static void continuous_motion_is_served_by_separate_pulses() {
   reset(); ready();
   std::vector<uint64_t> starts, lengths;
   bool wasOn = false;
-  for (uint64_t ms = 3000; ms <= 6060; ++ms) {
+  for (uint64_t ms = 3000; ms <= 6600; ++ms) {
     if (ms <= 6000 && (ms - 3000) % 100 == 0) edge(ms);
     else tick(ms);
     const bool on = hardware::levels[3] == HIGH;
@@ -154,14 +191,11 @@ static void continuous_motion_is_served_by_separate_pulses() {
     if (!on && wasOn) lengths.push_back(ms - starts.back());
     wasOn = on;
   }
-  const std::vector<uint64_t> expectedStarts = {3000, 3300, 3600, 3900, 4200,
-                                               4500, 4900, 5300, 5700};
-  const std::vector<uint64_t> expectedLengths = {200, 220, 240, 260, 280,
-                                                300, 320, 340, 360};
+  const std::vector<uint64_t> expectedStarts = {3000, 3600, 4200, 4800, 5400, 6000};
+  const std::vector<uint64_t> expectedLengths = {200, 220, 240, 260, 280, 300};
   assert(starts == expectedStarts && lengths == expectedLengths);
-  assert(ultimoPeriodoMs == 400 && frontiPeriodo == 4);
-  tick(6359); assert(stato == ATTENDI_ARRESTO);
-  tick(6360); assert(stato == ATTENDI_PRIMO_FRONTE);
+  assert(ultimoPeriodoMs == 600 && frontiPeriodo == 6);
+  assert(stato == ATTENDI_FRONTE && hardware::levels[3] == LOW);
 }
 
 static void maximum_motor_on_duration() {
@@ -169,19 +203,21 @@ static void maximum_motor_on_duration() {
   const uint16_t expected[] = {200, 220, 240, 260, 280, 300, 320, 340,
                                360, 380, 400, 400, 400, 400, 400};
   for (uint64_t cycle = 0; cycle < 15; ++cycle) {
-    const uint64_t start = 3000 + cycle * 600;
+    const uint64_t start = 3000 + cycle * 1000;
     edge(start);
     assert(durataMotorOnMs == expected[cycle]);
-    edge(start + 50);
+    edge(start + 50); edge(start + 100);
     tick(start + expected[cycle]);
     assert(hardware::levels[3] == LOW);
+    tick(start + expected[cycle] + 300);
+    assert(stato == ATTENDI_FRONTE);
   }
 }
 
 static void minimum_motor_on_duration() {
   reset(); ready();
   const uint16_t expected[] = {200, 180, 160, 140, 120, 100, 80, 60,
-                               40, 20, 20, 20, 20, 20, 20};
+                               50, 50, 50, 50, 50, 50, 50};
   for (uint64_t cycle = 0; cycle < 15; ++cycle) {
     const uint64_t start = 3000 + cycle * 1000;
     edge(start);
@@ -189,7 +225,7 @@ static void minimum_motor_on_duration() {
     tick(start + expected[cycle]);
     assert(hardware::levels[3] == LOW);
     tick(start + expected[cycle] + 300);
-    assert(stato == ATTENDI_PRIMO_FRONTE);
+    assert(stato == ATTENDI_FRONTE);
   }
 }
 
@@ -215,7 +251,7 @@ static void millis_rollover() {
   const uint64_t first = wrap - 100;
   edge(first); tick(first + 199); assert(hardware::levels[3] == HIGH);
   tick(first + 200); assert(hardware::levels[3] == LOW);
-  tick(first + 500); assert(stato == ATTENDI_PRIMO_FRONTE);
+  tick(first + 500); assert(stato == ATTENDI_FRONTE);
   edge(first + 601);
   assert(ultimoPeriodoMs == 601 && frontiPeriodo == 1 && durataMotorOnMs == 180);
 }
@@ -240,9 +276,11 @@ static void congested_serial_does_not_extend_motor_on() {
 
 int main() {
   startup_and_input_without_pullup();
+  debug_mirrors_raw_edges_and_holdoff_is_fixed();
+  encoder_holdoff_micros_rollover();
   once_runs_only_on_state_entry();
   movement_while_waiting_for_initial_stop();
-  movement_repeats_pulse_before_quiet_timeout();
+  fixed_wait_ignores_edges_but_keeps_them_in_correction();
   correction_uses_same_time_and_counter_window();
   delayed_loop_measures_actual_motor_on_time();
   continuous_motion_is_served_by_separate_pulses();
@@ -252,5 +290,5 @@ int main() {
   millis_rollover();
   encoder_counter_rollover();
   congested_serial_does_not_extend_motor_on();
-  std::cout << "13 gruppi di test PASS (simulazione, non validazione del prototipo)\n";
+  std::cout << "15 gruppi di test PASS (simulazione, non validazione del prototipo)\n";
 }
