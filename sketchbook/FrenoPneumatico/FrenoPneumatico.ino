@@ -11,7 +11,7 @@ constexpr uint32_t ENCODER_HOLDOFF_US = 2000;
 constexpr uint32_t PRE_GONFIAGGIO_MS = 1500;
 constexpr uint32_t MOTOR_ON_TIMEOUT_MS = 200;   // Dalla fine dell'ultimo impulso di bloccaggio.
 constexpr uint32_t MS_PER_FRONTE = 600;
-constexpr uint32_t MS_CORR_PER_FRONTE_ATTESO = MS_PER_FRONTE; // Ogni 600 ms positivi aspetta un fronte in piu'.
+constexpr uint32_t MS_CORR_PER_FRONTE_ATTESO = MS_PER_FRONTE; // Solo senza mantenimenti precedenti: un fronte in piu' ogni 600 ms positivi.
 constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 150;
 constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 100;
 constexpr uint32_t INTERVALLO_MANTENIMENTO_MS = 600; // Fra due avvii, indipendente dall'obiettivo.
@@ -255,14 +255,18 @@ void aggiornaFreno(uint32_t now) {
 
       case MOTOR_ON:
         if (once) {                            // ONCE: nuovo timer, Dt e n; decidi il fronte di avvio.
+          // Salva il risultato del ciclo precedente PRIMA di azzerare i contatori.
+          // Conta i mantenimenti realmente avviati, anche se interrotti da un fronte.
+          const bool senzaMantenimentoPrima = precedenteSequenzaValida && indiceMantenimento == 0;
           bloccaggioAcceso = mantenimentoAcceso = false;
           numeroBloccaggi = tempoBloccaggioMs = 0;
           numeroMantenimenti = indiceMantenimento = 0;
           durataMotorOnMs = durataMantenimentoMs = 0;
           inizioSequenzaMs = inizioStatoMs = millis();
           memorizzaIntervallo(primaDeiFronti);
-          fronteAvvioBloccaggio = calcolaFronteAvvio(correzioneTempoMs);
-          // Durante l'attesa spegni anche un eventuale mantenimento ancora HIGH.
+          fronteAvvioBloccaggio = senzaMantenimentoPrima
+                                 ? calcolaFronteAvvio(correzioneTempoMs) : 1;
+          // Con mantenimenti precedenti Av=1: riparti subito, senza un passaggio LOW.
           if (frontiMotorOn < fronteAvvioBloccaggio) digitalWrite(MOTOR_PIN, LOW);
         }
         // ALWAYS: prima del primo B conta tutti i fronti, senza far partire il timeout.
@@ -365,14 +369,23 @@ void setup() {
   digitalWrite(DEBUG_PIN, digitalRead(ENCODER_PIN));
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, CHANGE);
   Serial.begin(115200);
-  Serial.println(F("Avvio freno - avvio proporzionale"));
-  Serial.println(F("Log: tempi in ms; Corr sempre con segno."));
-  Serial.println(F("Dt=tra ingressi MOTOR_ON; Np=fronti ciclo precedente."));
-  Serial.println(F("Corr=correzione accumulata; Av=fronte del primo B."));
-  Serial.println(F("B=bloccaggio; Imp=durata HIGH; Fr=fronti del ciclo."));
-  Serial.println(F("On=tempo MOTOR_ON con attesa/pause; Tm=mantenimento."));
-  Serial.println(F("M=impulsi mantenimento previsti; M:k/N=progressivo."));
-  Serial.println(F("t=dal primo B; d=tra avvii; s=stop; a=riavvio."));
+  Serial.println(F("Avvio freno - ritardo solo senza mantenimenti precedenti"));
+  Serial.println(F("Legenda log (tempi in ms):"));
+  Serial.println(F("Dt : delta t tra ingressi MOTOR_ON successivi"));
+  Serial.println(F("Np : fronti contati nel MOTOR_ON precedente"));
+  Serial.println(F("Corr : correzione accumulata, sempre con segno + o -"));
+  Serial.println(F("Av : numero del fronte che avvia il primo bloccaggio"));
+  Serial.println(F("B : numero dell'impulso di bloccaggio nel ciclo"));
+  Serial.println(F("Imp : durata dell'impulso di bloccaggio"));
+  Serial.println(F("Fr : fronti contati nel MOTOR_ON attuale"));
+  Serial.println(F("On : tempo totale in MOTOR_ON, incluse attesa e pause"));
+  Serial.println(F("Tm : durata della finestra di mantenimento"));
+  Serial.println(F("M : numero di impulsi di mantenimento previsti"));
+  Serial.println(F("M:k/N : mantenimento avviato k su N previsti"));
+  Serial.println(F("t : tempo dall'avvio del primo bloccaggio del ciclo"));
+  Serial.println(F("d : distanza tra avvii di impulsi consecutivi"));
+  Serial.println(F("s : arresta il controllo"));
+  Serial.println(F("a : da fermo riavvia con pregonfiaggio"));
   cambiaStato(PRE_GONFIAGGIO);
   aggiornaFreno(millis());                    // Esegue subito il once iniziale.
 }

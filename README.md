@@ -12,7 +12,7 @@ stateDiagram-v2
     [*] --> PRE_GONFIAGGIO
     PRE_GONFIAGGIO --> ATTENDI_FRONTE: 1500 ms
     ATTENDI_FRONTE --> MOTOR_ON: primo fronte valido
-    MOTOR_ON --> MOTOR_ON: attende il fronte Av, poi genera il primo B
+    MOTOR_ON --> MOTOR_ON: se Corr positiva e nessun mantenimento precedente, attende Av
     MOTOR_ON --> MOTOR_ON: nuovo fronte dopo lo spegnimento, altro B
     MOTOR_ON --> MANTENIMENTO: 200 ms dall'ultimo spegnimento B
     MANTENIMENTO --> MANTENIMENTO: impulsi da 100 ms ogni 600 ms
@@ -24,7 +24,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `PRE_GONFIAGGIO` | Azzera campioni e correzione; accende il motore | Dopo 1500 ms passa a `ATTENDI_FRONTE` |
 | `ATTENDI_FRONTE` | Spegne il motore | Al primo fronte passa a `MOTOR_ON` |
-| `MOTOR_ON` | Memorizza Dt, aggiorna Corr, sceglie Av e inizia il nuovo n | Aspetta Av a motore spento; poi genera bloccaggi da 150 ms; dopo 200 ms dall'ultimo spegnimento passa al mantenimento |
+| `MOTOR_ON` | Salva se il ciclo precedente ha eseguito mantenimenti; memorizza Dt, aggiorna Corr, sceglie Av e inizia il nuovo n | Primo B immediato, oppure attende Av solo con Corr positiva e nessun mantenimento precedente; poi bloccaggi da 150 ms; dopo 200 ms dall'ultimo spegnimento passa al mantenimento |
 | `MANTENIMENTO` | Calcola t_m dal nuovo n e dal tempo completo in MOTOR_ON | Impulsi da 100 ms ogni 600 ms; al primo fronte torna a `MOTOR_ON`; a fine t_m passa a `ATTENDI_FRONTE` |
 | `FERMO` | Spegne il motore | Attende il comando `a` |
 
@@ -35,19 +35,31 @@ nel loop che lo termina: serve un nuovo fronte dopo l'ingresso in attesa.
 ## Primo bloccaggio proporzionale alla correzione
 
 All'ingresso in `MOTOR_ON`, il controllo aggiorna la correzione accumulata
-prima di decidere quando generare il primo bloccaggio:
+prima di decidere quando generare il primo bloccaggio. L'attesa proporzionale
+si applica **solo con Corr positiva e nessun impulso di mantenimento
+realmente avviato nel ciclo precedente**. Se il ciclo precedente ha eseguito
+anche un solo mantenimento, il primo fronte accende subito il bloccaggio,
+indipendentemente dal valore positivo di Corr. Anche il primo ciclo dopo
+il pregonfiaggio parte subito, senza una storia precedente.
+
+Il conteggio dei mantenimenti precedenti viene salvato prima di azzerare
+i contatori del nuovo ciclo. Si usa `indiceMantenimento`, cioe' il numero
+effettivamente avviato, anche se l'ultimo impulso e' interrotto dal fronte;
+il numero nominale previsto nel campo M del log non decide l'attesa.
 
 ```text
 Dt = ingresso MOTOR_ON attuale - ingresso MOTOR_ON precedente
 Corr += Dt - n_precedente * MS_PER_FRONTE
-Av = 1                              se Corr <= 0
-Av = 1 + ceil(Corr / MS_CORR_PER_FRONTE_ATTESO)   se Corr > 0
+ritarda = ciclo_precedente_valido && mantenimenti_avviati_precedenti == 0 && Corr > 0
+Av = 1                                         se non ritarda
+Av = 1 + ceil(Corr / MS_CORR_PER_FRONTE_ATTESO)   se ritarda
 ```
 
 `MS_CORR_PER_FRONTE_ATTESO` vale inizialmente **600 ms**, come
 `MS_PER_FRONTE`, ma puo' essere regolato separatamente. `Av` e' il numero
 cumulativo di fronti necessario per la **prima** accensione del ciclo.
-Il fronte che ha causato l'ingresso e' gia' il numero 1.
+Il fronte che ha causato l'ingresso e' gia' il numero 1. La tabella seguente
+si applica quando il ciclo precedente **non ha avviato mantenimenti**:
 
 | Corr all'ingresso | Primo bloccaggio |
 | --- | --- |
@@ -66,13 +78,15 @@ main reagisse, vengono tutti contati e possono soddisfare subito Av.
 Se la soglia non e' raggiunta, lo stato resta a motore spento: il timeout
 parte soltanto dalla fine del primo bloccaggio effettivamente generato.
 
-Un fronte durante un mantenimento puo' far entrare in `MOTOR_ON` mentre
-il motore e' HIGH. Se occorre aspettare Av, quel mantenimento viene spento
-subito. Con Av=1 il nuovo bloccaggio mantiene HIGH senza un passaggio LOW.
-L'ISR non accende il motore.
+Un fronte durante un mantenimento gia' avviato fa entrare subito in
+`MOTOR_ON` con Av=1. Se il motore e' HIGH, il nuovo bloccaggio mantiene HIGH
+senza un passaggio LOW; se e' nella pausa, si accende nello stesso loop.
+Questa regola vale anche dopo la fine della finestra, in `ATTENDI_FRONTE`,
+se il ciclo ha eseguito mantenimenti. L'ISR non accende il motore.
 
 Questa strategia permette al freno di muoversi prima della prima frenata
-quando Corr e' positiva. Il maggiore n del ciclo contribuisce a ridurre
+quando la sola fase di bloccaggio frena troppo e non vengono eseguiti
+mantenimenti. Il maggiore n del ciclo contribuisce a ridurre
 la correzione al prossimo ingresso. Non si azzera artificialmente Corr.
 La scelta del bloccaggio singolo e il campo S della versione precedente
 sono stati sostituiti dall'avvio proporzionale, riconoscibile dal campo Av.
@@ -140,10 +154,13 @@ anche se B parte piu' tardi. I timestamp del log `t` partono invece dal
 **primo B effettivo**: per questo la sua riga conserva t=0. `d` misura
 la distanza fra avvii effettivi, anche se qualche riga viene persa.
 
-Esempio con Corr=600 ms: Av=2. Se il secondo fronte arriva 100 ms dopo
+Esempio con Corr=600 ms e nessun mantenimento nel ciclo precedente: Av=2.
+Se il secondo fronte arriva 100 ms dopo
 l'ingresso, B parte allora; si spegne a 250 ms e il timeout termina a
 450 ms. Con n=2, t_m=1200-450-600=150 ms e M=1. Il mantenimento parte
-450 ms dall'ingresso, ma il suo log mostra t=350 ms dal primo B.
+450 ms dall'ingresso, ma il suo log mostra t=350 ms dal primo B. Avendo
+eseguito quel mantenimento, il ciclo successivo parte al primo fronte,
+anche se Corr rimane positiva.
 
 ## Coerenza e limiti
 
@@ -152,8 +169,8 @@ sono discreti, quindi possono produrre cicli alternati intorno all'obiettivo.
 L'obiettivo e' **600 ms per fronte accettato**; CHANGE conta salita e
 discesa, se entrambi superano il filtro.
 
-Con carichi bassi, aspettare piu' fronti permette di recuperare una
-correzione positiva senza ripetere continuamente la prima frenata troppo
+Con carichi bassi che non richiedono mantenimenti, aspettare piu' fronti
+permette di recuperare una correzione positiva senza ripetere la prima frenata troppo
 presto. Il recupero dipende dai fronti e dalla risposta fisica effettivi:
 se il freno libero genera fronti piu' lentamente dell'obiettivo, il
 controllo non puo' crearne di aggiuntivi. Senza nuovi fronti durante
@@ -175,7 +192,7 @@ motore a 2000 ms.
 | `IMPULSO_MANTENIMENTO_MS` | 100 | Durata di ogni mantenimento |
 | `INTERVALLO_MANTENIMENTO_MS` | 600 | Distanza fra avvii di mantenimento |
 | `MS_PER_FRONTE` | 600 | Cadenza media obiettivo |
-| `MS_CORR_PER_FRONTE_ATTESO` | 600 | Correzione per ogni fronte aggiuntivo prima di B |
+| `MS_CORR_PER_FRONTE_ATTESO` | 600 | Correzione per ogni fronte aggiuntivo prima di B, solo senza mantenimenti precedenti |
 | `ENCODER_HOLDOFF_US` | 2000 | Tempo minimo fra fronti accettati |
 
 ## Collegamenti e ISR
@@ -214,10 +231,31 @@ questo campione con quello gia' letto nel main loop.
 ## Log e comandi seriali
 
 Monitor seriale a **115200 baud**. All'alimentazione o reset si stampa
-`Avvio freno - avvio proporzionale`, seguito dalla legenda dei campi.
+`Avvio freno - ritardo solo senza mantenimenti precedenti`, seguito dalla
+legenda dei campi.
 Questo testo permette di riconoscere il firmware caricato. La legenda
-specifica che tutti i tempi sono in ms e Corr viene sempre stampata con
-segno, positiva, zero o negativa. Con o senza terminazione di riga:
+riporta **un campo per riga**; tutti i tempi sono in ms e Corr viene sempre
+stampata con segno, positiva, zero o negativa:
+
+```text
+Dt : delta t tra ingressi MOTOR_ON successivi
+Np : fronti contati nel MOTOR_ON precedente
+Corr : correzione accumulata, sempre con segno + o -
+Av : numero del fronte che avvia il primo bloccaggio
+B : numero dell'impulso di bloccaggio nel ciclo
+Imp : durata dell'impulso di bloccaggio
+Fr : fronti contati nel MOTOR_ON attuale
+On : tempo totale in MOTOR_ON, incluse attesa e pause
+Tm : durata della finestra di mantenimento
+M : numero di impulsi di mantenimento previsti
+M:k/N : mantenimento avviato k su N previsti
+t : tempo dall'avvio del primo bloccaggio del ciclo
+d : distanza tra avvii di impulsi consecutivi
+s : arresta il controllo
+a : da fermo riavvia con pregonfiaggio
+```
+
+I comandi funzionano con o senza terminazione di riga:
 
 | Comando | Effetto |
 | --- | --- |
@@ -251,7 +289,8 @@ M:2/2 t:      1290 d:       600
 | `Fr` | Fronti attuali sulla riga B; fronti finali sul riepilogo |
 | `On` | Tempo completo in MOTOR_ON, anche durante l'attesa e LOW |
 | `Tm` | Finestra temporale di mantenimento |
-| `M` | Numero nominale di mantenimenti; M:k/N indica il progressivo |
+| `M` | Numero nominale di mantenimenti previsti |
+| `M:k/N` | Mantenimento realmente avviato k, su N nominalmente previsti |
 | `t` | Tempo dal primo B effettivo, che vale zero sulla prima riga B |
 | `d` | Distanza fra avvii effettivi; sul primo B vale zero |
 
@@ -266,13 +305,6 @@ Corr rimane in coda per un loop successivo invece di essere scartata.
 Non si attende la seriale. Con congestione prolungata che riempie anche
 la coda, le nuove righe vengono saltate interamente; i log non alterano
 accensioni, timer o conteggi. Il testo di avvio si stampa solo in setup.
-
-Il log precedente riportato senza il campo S non coincide con la
-versione 4e91b33, che inibiva i B successivi con Corr positiva e M=0 nel
-ciclo precedente. Il marcatore di avvio e Av permettono di verificare
-che sia stata caricata la nuova strategia. Anche nella vecchia versione
-Corr aveva entrambi i segni, ma una riga poteva essere scartata per spazio
-UART insufficiente.
 
 ## Struttura e verifiche
 
@@ -304,22 +336,26 @@ La toolchain cloud e' Arduino CLI 1.4.1, megaAVR 1.8.8, API 1.3.1 e AVR GCC
 Debian 14.2.0, diverso dal compilatore del pacchetto Arduino standard.
 Il caricamento USB non e' verificato.
 
-I **45 gruppi di test** simulati coprono GPIO, ISR, filtro/holdoff,
+I **48 gruppi di test** simulati coprono GPIO, ISR, filtro/holdoff,
 ONCE/ALWAYS, bloccaggi e timeout, conteggi separati, mantenimento regolare
 e interrompibile, formule e limiti, rollover, stop/riavvio e UART.
 Le verifiche dell'avvio proporzionale comprendono le soglie positive,
 zero e negative, il secondo/terzo fronte, i valori Corr del log riportato,
 assenza di timeout prima del primo B, fronti accumulati prima del main,
-attesa durante il mantenimento, bloccaggi multipli dopo Av e tempi del log.
+bloccaggio immediato dopo mantenimenti completati o interrotti anche con
+Corr positiva elevata, conteggio reale distinto dal numero nominale,
+ritorno all'avvio immediato dopo un ciclo ritardato che esegue mantenimento,
+bloccaggi multipli dopo Av e tempi del log. La legenda viene verificata
+con un campo per riga.
 La UART viene simulata anche mentre si riempie: Corr negativa resta in
 coda dopo B e viene emessa appena c'e' spazio; la coda piena non blocca
 il controllo e non sovrascrive le righe pendenti.
 
 Nel modello a basso carico, il freno libero genera un fronte ogni 100 ms
 ed e' rilasciato 3000 ms dopo LOW. Su 300 cicli, la nuova strategia ottiene
-circa **601,6 ms per fronte** e mantiene la correzione massima a **3050 ms**.
+circa **601,6 ms per fronte** e mantiene la correzione massima a **5450 ms**.
 Il modello con quattro fronti per movimento e rilascio dopo 800 ms
-misura **600,8 ms per fronte** su 100 cicli. Sono risultati simulati;
+misura **602 ms per fronte** su 100 cicli. Sono risultati simulati;
 la risposta e la stabilita' del prototipo reale richiedono verifica hardware.
 
 ```sh
