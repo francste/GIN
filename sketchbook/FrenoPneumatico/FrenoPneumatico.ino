@@ -14,8 +14,8 @@ constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 150; // Prima accensione di ogni sequ
 constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 70;
 constexpr uint16_t RICHIESTA_MINIMA_MS = IMPULSO_BLOCCAGGIO_MS + IMPULSO_MANTENIMENTO_MS;
 constexpr uint16_t RICHIESTA_INIZIALE_MS = RICHIESTA_MINIMA_MS; // 220 ms: blocco + mantenimento.
-constexpr uint16_t KP_PER_MILLE = 100;         // Kp = 0,10 ms di correzione per ms di errore medio.
-constexpr uint16_t RICHIESTA_MASSIMA_MS = 400;
+constexpr uint16_t KP_PER_MILLE = 1000;        // Kp = 1 ms di correzione per ms di errore medio.
+constexpr uint16_t RICHIESTA_MASSIMA_MS = 2000;
 static_assert(IMPULSO_BLOCCAGGIO_MS > 0 && IMPULSO_BLOCCAGGIO_MS <= RICHIESTA_MASSIMA_MS &&
               IMPULSO_MANTENIMENTO_MS > 0 &&
               uint32_t(IMPULSO_BLOCCAGGIO_MS) + IMPULSO_MANTENIMENTO_MS <= RICHIESTA_MASSIMA_MS,
@@ -38,11 +38,9 @@ uint32_t ultimoImpulsoMs = 0;                  // Accensione precedente, anche s
 volatile uint32_t encoderTotale = 0;
 uint32_t ultimoFronteValidoUs = 0;              // Usato soltanto nell'ISR.
 bool fronteValidoRicevuto = false;             // Accetta anche il primo fronte a t=0.
-// L'ISR accende subito e registra i confini esatti del nuovo bloccaggio.
+// L'ISR segnala il fronte; soltanto il main loop comanda il motore.
 volatile bool encoderPronto = false;
 volatile bool bloccaggioRichiesto = false;
-volatile uint32_t bloccaggioMs = 0;
-volatile uint32_t bloccaggioFronti = 0;
 bool precedenteSequenzaValida = false;
 uint32_t precedenteSequenzaMs = 0;
 uint32_t totaleAllaSequenza = 0;
@@ -60,16 +58,13 @@ void encoderISR() {
   fronteValidoRicevuto = true;
   ++encoderTotale;                             // CHANGE: conta salita e discesa.
   if (encoderPronto) {
-    digitalWrite(MOTOR_PIN, HIGH);             // Prima di calcoli, log e prossimo loop.
-    bloccaggioMs = millis();
-    bloccaggioFronti = encoderTotale;
     encoderPronto = false;                    // Gli altri fronti si contano fino alla fine dei 150 ms.
     bloccaggioRichiesto = true;
   }
 }
 
 void attendiEncoder() {
-  // Non spegne un bloccaggio appena richiesto dall'ISR.
+  // Abilita la richiesta di bloccaggio su un nuovo fronte.
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     if (!bloccaggioRichiesto) {
       digitalWrite(MOTOR_PIN, LOW);
@@ -83,7 +78,7 @@ uint16_t durataImpulsoMs() {
 }
 
 void stampaImpulso(int16_t correzioneMs) {
-  char riga[64];
+  char riga[80];
   int lunghezza;
   if (indiceImpulso == 0) {
     // Solo il bloccaggio ha il campione completo e la correzione della richiesta.
@@ -155,18 +150,14 @@ void preparaSequenza(uint32_t now, uint32_t totale) {
 
 void aggiornaFreno(uint32_t now) {
   bool nuovoBloccaggio = false;
-  uint32_t avvioBloccaggioMs = 0, frontiAlBloccaggio = 0;
-  // Copia atomica della richiesta e dei campioni a 32 bit scritti nell'ISR.
+  // Consuma la richiesta ISR: l'accensione viene eseguita nel ONCE di MOTOR_ON.
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     if (bloccaggioRichiesto) {
-      avvioBloccaggioMs = bloccaggioMs;
-      frontiAlBloccaggio = bloccaggioFronti;
       bloccaggioRichiesto = false;
       nuovoBloccaggio = true;
     }
   }
   if (nuovoBloccaggio) {
-    now = millis();                          // Il fronte puo' essere arrivato dopo il now del loop.
     indiceImpulso = 0;                        // Il fronte annulla i mantenimenti della vecchia sequenza.
     cambiaStato(MOTOR_ON);
   }
@@ -211,18 +202,24 @@ void aggiornaFreno(uint32_t now) {
         break;
 
       case ATTENDI_FRONTE:
-        if (once) attendiEncoder();            // ONCE: abilita un unico bloccaggio dall'ISR.
+        if (once) attendiEncoder();            // ONCE: abilita la richiesta sul primo fronte.
         // ALWAYS: resta in attesa; la richiesta ISR e' gestita all'inizio del loop.
         break;
 
       case MOTOR_ON:
-        if (once) {                            // ONCE: l'ISR ha gia' acceso il motore.
+        if (once) {                            // ONCE: accendi prima di calcoli e log.
           mantenimentoAcceso = false;
+          uint32_t frontiAlBloccaggio;
+          ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            digitalWrite(MOTOR_PIN, HIGH);
+            inizioStatoMs = millis();         // I 150 ms partono dall'accensione nel main loop.
+            frontiAlBloccaggio = encoderTotale;
+          }
           const uint16_t richiestaPrecedenteMs = tempoRichiestoMs;
-          preparaSequenza(avvioBloccaggioMs, frontiAlBloccaggio);
+          preparaSequenza(inizioStatoMs, frontiAlBloccaggio);
           const int16_t correzioneMs = int16_t(tempoRichiestoMs) - int16_t(richiestaPrecedenteMs);
-          inizioStatoMs = avvioBloccaggioMs;    // 150 ms dall'accensione effettiva nell'ISR.
           stampaImpulso(correzioneMs);
+          now = millis();                    // Aggiorna anche un now letto prima del fronte.
         }
         // ALWAYS: i fronti si contano, senza allungare il bloccaggio.
         if (uint32_t(now - inizioStatoMs) >= IMPULSO_BLOCCAGGIO_MS) {
@@ -242,7 +239,7 @@ void aggiornaFreno(uint32_t now) {
         if (mantenimentoAcceso) {
           if (uint32_t(now - inizioStatoMs) >= IMPULSO_MANTENIMENTO_MS) {
             ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-              // Un fronte arrivato durante questo loop deve lasciare il motore acceso.
+              // Una nuova richiesta ha precedenza sullo spegnimento del mantenimento.
               if (!bloccaggioRichiesto) {
                 digitalWrite(MOTOR_PIN, LOW);
                 mantenimentoAcceso = false;

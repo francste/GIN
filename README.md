@@ -21,18 +21,18 @@ stateDiagram-v2
     [*] --> PRE_GONFIAGGIO
     PRE_GONFIAGGIO --> ATTENDI_ARRESTO: 1500 ms
     ATTENDI_ARRESTO --> ATTENDI_FRONTE: 300 ms fissi
-    ATTENDI_FRONTE --> MOTOR_ON: fronte valido, accensione immediata nell'ISR
+    ATTENDI_FRONTE --> MOTOR_ON: richiesta encoder, accensione nel main loop
     MOTOR_ON --> MANTENIMENTO: fine bloccaggio da 150 ms
     MANTENIMENTO --> MANTENIMENTO: impulsi da 70 ms, poi attesa del fronte
-    MANTENIMENTO --> MOTOR_ON: primo fronte valido, bloccaggio immediato nell'ISR
+    MANTENIMENTO --> MOTOR_ON: primo fronte valido, bloccaggio nel main loop
 ```
 
 | Stato | ONCE: all'ingresso | ALWAYS: a ogni loop |
 | --- | --- | --- |
 | `PRE_GONFIAGGIO` | Ripristina la prova; accende la pompa | Dopo 1500 ms passa ad attesa arresto |
 | `ATTENDI_ARRESTO` | Spegne la pompa; avvia il timeout iniziale | Dopo 300 ms passa soltanto a `ATTENDI_FRONTE`, indipendentemente dai fronti |
-| `ATTENDI_FRONTE` | Spegne la pompa e abilita l'accensione dall'ISR | Attesa del primo avvio dopo il pregonfiaggio; al fronte passa a `MOTOR_ON` |
-| `MOTOR_ON` | Prepara e corregge la nuova sequenza; stampa il log completo | Dopo 150 ms dal fronte passa a `MANTENIMENTO`; i fronti ulteriori vengono solo contati |
+| `ATTENDI_FRONTE` | Spegne la pompa e abilita la richiesta encoder | Attesa del primo avvio dopo il pregonfiaggio; al fronte passa a `MOTOR_ON` |
+| `MOTOR_ON` | Accende la pompa, campiona tempo e fronti, corregge la nuova sequenza e stampa il log | Dopo 150 ms dall'accensione passa a `MANTENIMENTO`; i fronti ulteriori vengono solo contati |
 | `MANTENIMENTO` | Spegne la pompa, prepara i mantenimenti e abilita il fronte | Genera le accensioni da 70 ms, poi rimane qui in attesa; al primo fronte interrompe la sequenza e torna a `MOTOR_ON` |
 | `FERMO` | Spegne la pompa | Aspetta il comando di riavvio |
 
@@ -44,17 +44,19 @@ Anche un fronte osservato nel loop che chiude l'attesa viene consumato;
 serve un nuovo fronte dopo l'abilitazione in `ATTENDI_FRONTE` per avviare la sequenza.
 Questa attesa di 300 ms si esegue soltanto dopo il pregonfiaggio.
 
-Il primo fronte valido in `ATTENDI_FRONTE` o `MANTENIMENTO` accende il motore
-direttamente nell'ISR, prima dei calcoli e delle stampe. L'ISR registra
-istante e contatore di quel fronte; il loop ricalcola una sola volta la
-richiesta e passa a `MOTOR_ON`, cancellando i mantenimenti residui.
-Il bloccaggio dura `IMPULSO_BLOCCAGGIO_MS`, inizialmente 150 ms dal fronte
-rilevato: la correzione non modifica questa durata. L'accensione dall'ISR
-rimane disabilitata soltanto durante `MOTOR_ON`; si riabilita all'ingresso
+Il primo fronte valido in `ATTENDI_FRONTE` o `MANTENIMENTO` imposta la
+richiesta di bloccaggio nell'ISR. L'ISR non comanda il motore. Il main loop
+consuma la richiesta e passa a `MOTOR_ON`, cancellando i mantenimenti residui.
+Nel ONCE accende il motore prima dei calcoli e delle stampe, poi campiona
+tempo e contatore per la correzione. Il bloccaggio dura
+`IMPULSO_BLOCCAGGIO_MS`, inizialmente 150 ms dall'accensione nel main loop:
+la correzione non modifica questa durata. La richiesta di un altro
+bloccaggio rimane disabilitata durante `MOTOR_ON`; si riabilita all'ingresso
 di `MANTENIMENTO`. I fronti gia' contati durante il bloccaggio non vengono
 accodati: serve un nuovo fronte dopo l'abilitazione.
 Se il fronte arriva durante un mantenimento acceso, il motore rimane HIGH
-senza una commutazione LOW; i nuovi 150 ms decorrono da quel fronte.
+senza una commutazione LOW; i nuovi 150 ms decorrono dall'ingresso in
+`MOTOR_ON` nel main loop.
 
 La prima sequenza mantiene la richiesta iniziale di 220 ms e registra la
 base del confronto, senza correzione. Manca ancora un periodo `Dt` misurato:
@@ -64,7 +66,7 @@ segue questa regola.
 
 ## Distribuzione delle accensioni
 
-La richiesta viene limitata fra 220 e 400 ms. Il minimo e' calcolato come
+La richiesta viene limitata fra 220 e 2000 ms. Il minimo e' calcolato come
 `IMPULSO_BLOCCAGGIO_MS + IMPULSO_MANTENIMENTO_MS`: il bloccaggio da 150 ms
 viene sottratto e il residuo contiene sempre almeno un mantenimento da 70 ms.
 Si distribuiscono gli avvii sul periodo misurato; soltanto quando non
@@ -88,6 +90,8 @@ Con `Dt = 2000 ms` e richiesta di 300 ms, il residuo e' 150 ms: si programmano
 **150, 70 e 70 ms**. Il tempo totale acceso e' **290 ms**: la divisione
 arrotonda per difetto e il resto non viene recuperato. Questi istanti e
 totali valgono se non arrivano fronti che interrompono il mantenimento.
+Alla richiesta massima di **2000 ms** si programmano un bloccaggio e
+**26 mantenimenti**, per **27 accensioni** e 1970 ms totali accesi.
 
 Le durate fisiche restano fisse, 150 e 70 ms. Il resto inferiore a 70 ms
 non genera un altro mantenimento. La durata minima programmata e' 220 ms;
@@ -121,8 +125,9 @@ Non si sovrappongono due accensioni. Se l'intervallo calcolato e' piu'
 breve della durata di un impulso, si aspetta la sua fine e un loop
 successivo con il motore spento prima di iniziare il mantenimento seguente.
 `t` e `d` mostrano sempre gli avvii effettivi.
-Il bloccaggio parte nell'ISR e i suoi 150 ms decorrono
-da quell'istante, anche se il loop gestisce la richiesta in ritardo.
+Il bloccaggio parte nel main loop e i suoi 150 ms decorrono da
+quell'accensione effettiva. Un ritardo fra il fronte encoder e il main
+loop ritarda l'accensione, senza accorciare i 150 ms.
 Ogni mantenimento parte quando il loop osserva la scadenza e dura 70 ms
 dall'accensione effettiva. Se il loop e' in ritardo, i mantenimenti possono
 slittare e gli spegnimenti ritardare. Fra un avvio effettivo e il successivo
@@ -131,8 +136,8 @@ impulsi ravvicinati per recuperare le scadenze arretrate.
 
 ## Correzione del tempo richiesto
 
-Tempo e contatore vengono campionati nell'ISR una volta, al fronte che avvia
-il bloccaggio. I fronti successivi e le accensioni di mantenimento non
+Tempo e contatore vengono campionati insieme nel main loop una volta,
+all'accensione di bloccaggio. I fronti successivi e le accensioni di mantenimento non
 cambiano questi campioni. Il loop applica la correzione una sola volta
 all'ingresso di `MOTOR_ON`, anche quando un fronte interrompe il mantenimento.
 Dal secondo avvio si calcolano sullo stesso intervallo:
@@ -141,7 +146,7 @@ Dal secondo avvio si calcolano sullo stesso intervallo:
 n = contatore attuale - contatore all'inizio della sequenza precedente
 tempo medio per fronte = Dt / n
 errore medio = 600 ms - tempo medio per fronte
-Kp = KP_PER_MILLE / 1000 = 0,10
+Kp = KP_PER_MILLE / 1000 = 1
 
 correzione = arrotonda(Kp * errore medio)
 richiesta = limita(richiesta precedente + correzione, minimo, massimo)
@@ -150,10 +155,10 @@ richiesta = limita(richiesta precedente + correzione, minimo, massimo)
 La correzione e' proporzionale allo scostamento del tempo medio rispetto
 ai 600 ms obiettivo: media inferiore (movimento rapido) aumenta la richiesta;
 media superiore (movimento lento) la diminuisce. Si aggiorna la richiesta
-precedente, senza un passo fisso. Con `KP_PER_MILLE = 100`, un errore di
-100 ms produce 10 ms di correzione; un errore di 300 ms ne produce 30.
+precedente, senza un passo fisso. Con `KP_PER_MILLE = 1000`, un errore di
+100 ms produce 100 ms di correzione; un errore di 300 ms ne produce 300.
 Per attenuare la regolazione si puo' ridurre `KP_PER_MILLE`, per esempio a
-50 (Kp = 0,05). Il guadagno va verificato sul prototipo.
+100 (Kp = 0,10). Il guadagno va verificato sul prototipo.
 
 Il calcolo intero usa prodotti a 64 bit e conserva la frazione di `Dt/n`
 fino all'arrotondamento finale al millisecondo piu' vicino, simmetrico nei
@@ -164,16 +169,16 @@ Esempi dai campioni misurati, prima dei limiti della richiesta:
 
 | Dt (ms) | Fronti | Media (ms/fronte) | Correzione (ms) |
 | --- | --- | --- | --- |
-| 3340 | 8 | 417,5 | +18 |
-| 2867 | 14 | 204,8 | +40 |
-| 3738 | 4 | 934,5 | -33 |
-| 2865 | 47 | 61,0 | +54 |
-| 5059 | 5 | 1011,8 | -41 |
+| 3340 | 8 | 417,5 | +183 |
+| 2867 | 14 | 204,8 | +395 |
+| 3738 | 4 | 934,5 | -335 |
+| 2865 | 47 | 61,0 | +539 |
+| 5059 | 5 | 1011,8 | -412 |
 
-La richiesta resta tra **220 e 400 ms**, con valore iniziale **220 ms**.
-Anche il valore iniziale viene limitato: impostare 500 ms con massimo
-400 ms avvia direttamente a 400 ms. Nel log `Corr` indica la variazione
-effettiva dopo i limiti: a 400 ms un incremento richiesto mostra `Corr:+0`,
+La richiesta resta tra **220 e 2000 ms**, con valore iniziale **220 ms**.
+Anche il valore iniziale viene limitato: impostare 2500 ms con massimo
+2000 ms avvia direttamente a 2000 ms. Nel log `Corr` indica la variazione
+effettiva dopo i limiti: a 2000 ms un incremento richiesto mostra `Corr:+0`,
 mentre una riduzione puo' ancora essere applicata.
 La nuova richiesta viene subito convertita nel numero di accensioni della
 sequenza. Una correzione puo' lasciare invariato il numero di
@@ -200,9 +205,9 @@ I parametri sono all'inizio del `.ino`:
 | `IMPULSO_BLOCCAGGIO_MS` | 150 | Prima accensione di ogni sequenza |
 | `IMPULSO_MANTENIMENTO_MS` | 70 | Accensioni successive distribuite su Dt |
 | `RICHIESTA_INIZIALE_MS` | 220 | Tempo totale richiesto iniziale, pari al minimo |
-| `KP_PER_MILLE` | 100 | Guadagno proporzionale: 100 corrisponde a Kp = 0,10 |
+| `KP_PER_MILLE` | 1000 | Guadagno proporzionale: 1000 corrisponde a Kp = 1 |
 | `RICHIESTA_MINIMA_MS` | 220 | Bloccaggio + un mantenimento, calcolato dalle due durate |
-| `RICHIESTA_MASSIMA_MS` | 400 | Richiesta massima |
+| `RICHIESTA_MASSIMA_MS` | 2000 | Richiesta massima |
 
 ```text
 GIN/
@@ -253,11 +258,12 @@ il debug mostra anche i rimbalzi. Il primo fronte viene accettato; dopo
 ciascun fronte accettato, quelli a meno di 2 ms vengono scartati dal contatore.
 A 2 ms esatti un fronte e' nuovamente valido. I rimbalzi scartati non
 prolungano il holdoff. Il filtro usa `micros()` e gestisce il suo rollover.
-Se il bloccaggio e' abilitato, lo stesso ISR attiva D3 immediatamente dopo
-il filtro e registra il campione. Gli altri fronti vengono contati, ma non
-possono sovrascriverlo o attivare un secondo bloccaggio fino alla fine dei
-150 ms e all'ingresso in `MANTENIMENTO`, che riabilita subito il fronte.
-Nessun calcolo di correzione o log seriale viene eseguito nell'ISR.
+Se il bloccaggio e' abilitato, l'ISR imposta `bloccaggioRichiesto` e
+disabilita altre richieste fino alla fine dei 150 ms e all'ingresso in
+`MANTENIMENTO`, che riabilita subito il fronte. Gli altri fronti vengono
+comunque contati. Il main loop accende D3 e campiona istante e contatore,
+includendo anche i fronti arrivati fra la richiesta e l'accensione.
+Nell'ISR non si comanda D3, non si calcola la correzione e non si stampa.
 
 Si contano salita e discesa: un impulso completo alto/basso vale due fronti
 se entrambi passano il filtro. Anche fronti reali distanziati meno di 2 ms
@@ -279,11 +285,11 @@ encoder usa `micros()`, senza `delay()`.
 
 Il log stampa `Avvio freno` all'alimentazione o reset, poi una riga a ogni
 avvio di bloccaggio e a ogni accensione di mantenimento. Esempio: richiesta
-precedente di 340 ms, `Dt = 2000 ms`, 2 fronti. La media e' 1000 ms;
-la correzione di -40 ms porta la richiesta a 300 ms:
+precedente di 700 ms, `Dt = 2000 ms`, 2 fronti. La media e' 1000 ms;
+la correzione di -400 ms porta la richiesta a 300 ms:
 
 ```text
-Imp:150 Corr: -40 Dt:      2000 Fr:    2 Req:300 1/3 t:0
+Imp:150 Corr:-400 Dt:      2000 Fr:    2 Req:300 1/3 t:0
 2/3 t:       666 d:       666
 3/3 t:      1333 d:       667
 ```
@@ -294,8 +300,11 @@ La riga completa viene stampata solo sul primo impulso, quello di bloccaggio.
 `Imp` e' la sua durata di 150 ms; `Req` e' il tempo totale richiesto dal
 regolatore; `1/3` indica l'accensione attuale e il numero totale, senza il
 prefisso `N:`. `Imp`, `Corr`, `Dt`, `Fr` e `Req` hanno larghezze minime fisse.
-La riga tipica occupa 57 byte e, con i parametri attuali, al massimo 62,
-incluso il newline: entra nel buffer UART anche con contatori a 10 cifre.
+La riga tipica occupa 57 byte, incluso il newline. Richieste a quattro
+cifre e numerazione fino a `27/27` possono allargarla; con contatori
+molto grandi puo' superare i 63 byte disponibili nella UART. In questo
+caso viene saltata, come ogni riga che non entra nel buffer, mantenendo
+corretti i timer e le distanze fisiche degli impulsi.
 Per ogni mantenimento si stampano il progressivo, `t` e `d`:
 
 - `t` e' il tempo dall'avvio del bloccaggio della sequenza corrente, dove
@@ -329,13 +338,13 @@ Le stampe avvengono nel codice principale, fuori dall'ISR dell'encoder.
 ## Lettura atomica e verifiche
 
 L'interrupt aggiorna PE1 e incrementa `encoderTotale` solo per fronti
-accettati dal holdoff. Quando il bloccaggio e' abilitato, accende D3 e salva
-la richiesta con istante e contatore. Il loop usa
-`ATOMIC_BLOCK(ATOMIC_RESTORESTATE)` della toolchain AVR per copiare insieme
-richiesta e campioni a 32 bit sul microcontrollore a 8 bit, ripristinando poi
-lo stato degli interrupt. Anche l'abilitazione del fronte e le commutazioni
-dei mantenimenti sono atomiche: una richiesta ISR gia' arrivata deve
-lasciare il motore HIGH e non essere sovrascritta da una scadenza.
+accettati dal holdoff. Quando il bloccaggio e' abilitato, imposta soltanto
+la richiesta. Il loop usa `ATOMIC_BLOCK(ATOMIC_RESTORESTATE)` della
+toolchain AVR per consumarla; nel ONCE di `MOTOR_ON` accende D3 e campiona
+insieme tempo e contatore a 32 bit sul microcontrollore a 8 bit,
+ripristinando poi lo stato degli interrupt. Anche l'abilitazione del
+fronte e le commutazioni dei mantenimenti sono atomiche: una richiesta
+gia' arrivata ha precedenza sulle scadenze e viene gestita nel prossimo loop.
 Durante `MOTOR_ON`, `encoderPronto` rimane falso: l'ISR conta i fronti
 senza cambiare l'uscita motore. In `MANTENIMENTO` rimane abilitato fino al
 primo fronte valido, anche dopo la fine delle accensioni programmate.
@@ -361,7 +370,7 @@ AVR GCC Debian 14.2.0, diverso da quello del pacchetto Arduino standard.
 Gli indici remoti e i tool di discovery non disponibili non impediscono
 la compilazione con il core locale. Il caricamento USB non e' verificato.
 
-I test verificano 33 gruppi: GPIO e prima sequenza, debug/holdoff,
+I test verificano 34 gruppi: GPIO e prima sequenza, debug/holdoff,
 rollover di `micros()`, ONCE, pregonfiaggio da 1500 ms e attesa iniziale fissa,
 bloccaggio da 150 ms e due mantenimenti da 70 ms con richiesta di 300 ms su
 2000 ms, interruzione del mantenimento in pausa e durante l'accensione,
@@ -370,13 +379,16 @@ l'ultimo mantenimento senza timeout operativo, fronti durante il bloccaggio
 contati senza riavviarlo e nuovo fronte abilitato gia' a 151 ms,
 correzione proporzionale sui campioni misurati, media per fronte e
 arrotondamento simmetrico, limiti e contatori grandi,
-distribuzione con intervalli frazionari, timestamp e conteggio congelati nell'ISR,
+distribuzione con intervalli frazionari, timestamp e conteggio campionati nel main loop,
 fronte arrivato dopo la lettura dell'orologio del loop,
+ISR senza scritture motore, avvio ritardato di 250 ms con bloccaggio
+comunque da 150 ms, sequenze fino a 27 accensioni con richiesta di 2000 ms,
 loop in ritardo, limiti della richiesta, stop/riavvio durante accensione
 e pausa, stop con richiesta ISR pendente, rollover di `millis()` e del contatore, periodi lunghi con prodotti
 a 64 bit, seriale congestionata, log di ogni accensione e spazio UART,
 timestamp e distanze effettive anche con righe saltate e loop in ritardo,
-righe con contatori e timestamp a 10 cifre entro il buffer da 63 byte,
+righe con contatori e timestamp a 10 cifre, righe da 63 byte inviate e
+righe piu' lunghe saltate senza ritardare il motore,
 minimo di 220 ms con mantenimento presente, prima sequenza senza Dt anche
 con richiesta maggiore, distribuzione sul Dt misurato senza distanza
 minima impostata, accensioni senza sovrapposizione con periodi brevi e
