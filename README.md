@@ -3,7 +3,7 @@
 Il firmware e' in `sketchbook/FrenoPneumatico/FrenoPneumatico.ino`.
 Ogni stato ha una parte **ONCE**, eseguita all'ingresso, e una parte
 **ALWAYS**, eseguita a ogni loop. L'ISR legge e filtra l'encoder e copia il
-livello grezzo sul debug PE1. Transizioni, timer e uscite motore sono nel main loop.
+livello grezzo su PE1. Timer, transizioni e uscite motore sono nel main loop.
 
 ## Sequenza
 
@@ -12,8 +12,9 @@ stateDiagram-v2
     [*] --> PRE_GONFIAGGIO
     PRE_GONFIAGGIO --> ATTENDI_FRONTE: 1500 ms
     ATTENDI_FRONTE --> MOTOR_ON: primo fronte valido
-    MOTOR_ON --> MOTOR_ON: nuovo fronte a motore spento, se S=0
-    MOTOR_ON --> MANTENIMENTO: 200 ms dalla fine dell'ultimo impulso
+    MOTOR_ON --> MOTOR_ON: attende il fronte Av, poi genera il primo B
+    MOTOR_ON --> MOTOR_ON: nuovo fronte dopo lo spegnimento, altro B
+    MOTOR_ON --> MANTENIMENTO: 200 ms dall'ultimo spegnimento B
     MANTENIMENTO --> MANTENIMENTO: impulsi da 100 ms ogni 600 ms
     MANTENIMENTO --> MOTOR_ON: primo fronte valido
     MANTENIMENTO --> ATTENDI_FRONTE: scadenza t_m
@@ -21,215 +22,160 @@ stateDiagram-v2
 
 | Stato | ONCE | ALWAYS |
 | --- | --- | --- |
-| `PRE_GONFIAGGIO` | Azzera campioni e correzione; accende il motore | Dopo 1500 ms passa direttamente a `ATTENDI_FRONTE` |
-| `ATTENDI_FRONTE` | Spegne il motore | Al primo fronte valido passa a `MOTOR_ON` |
-| `MOTOR_ON` | Accende il primo impulso; aggiorna Dt e t_corr; sceglie la modalita' S e inizia il nuovo conteggio n | Termina gli impulsi dopo 150 ms; in S=0 un fronte a motore spento genera un altro impulso; in S=1 esegue soltanto il primo; dopo 200 ms dall'ultimo spegnimento passa al mantenimento |
-| `MANTENIMENTO` | Calcola t_m dal nuovo n e dalla durata completa di MOTOR_ON | Genera impulsi da 100 ms ogni 600 ms; al primo fronte torna a `MOTOR_ON`; a fine t_m passa a `ATTENDI_FRONTE` |
+| `PRE_GONFIAGGIO` | Azzera campioni e correzione; accende il motore | Dopo 1500 ms passa a `ATTENDI_FRONTE` |
+| `ATTENDI_FRONTE` | Spegne il motore | Al primo fronte passa a `MOTOR_ON` |
+| `MOTOR_ON` | Memorizza Dt, aggiorna Corr, sceglie Av e inizia il nuovo n | Aspetta Av a motore spento; poi genera bloccaggi da 150 ms; dopo 200 ms dall'ultimo spegnimento passa al mantenimento |
+| `MANTENIMENTO` | Calcola t_m dal nuovo n e dal tempo completo in MOTOR_ON | Impulsi da 100 ms ogni 600 ms; al primo fronte torna a `MOTOR_ON`; a fine t_m passa a `ATTENDI_FRONTE` |
 | `FERMO` | Spegne il motore | Attende il comando `a` |
 
-Ogni transizione esegue subito il ONCE del nuovo stato nello stesso loop.
-Non c'e' uno stato `ATTENDI_ARRESTO`. I fronti del pregonfiaggio vengono
-consumati senza avviare o accodare bloccaggi. Anche un fronte osservato
-nel loop che termina il pregonfiaggio viene consumato: serve un nuovo
-fronte dopo l'ingresso in `ATTENDI_FRONTE`.
+Ogni transizione esegue il ONCE del nuovo stato nello stesso loop.
+I fronti del pregonfiaggio vengono consumati, compreso quello osservato
+nel loop che lo termina: serve un nuovo fronte dopo l'ingresso in attesa.
 
-## Bloccaggio normale e singolo
+## Primo bloccaggio proporzionale alla correzione
 
-Ogni accensione in `MOTOR_ON` dura `IMPULSO_BLOCCAGGIO_MS`, **150 ms**.
-Alla fine il motore si spegne e riparte `MOTOR_ON_TIMEOUT_MS`, **200 ms**,
-misurato dallo spegnimento effettivo. In modalita' normale (`S:0`):
-
-- Un fronte durante HIGH viene contato, senza prolungare l'impulso,
-  retriggerare il timeout o accodare altre accensioni.
-- Un nuovo fronte dopo lo spegnimento accende un altro impulso nel main
-  loop, senza uscire dallo stato o ricalcolare Dt e t_corr.
-- Un fronte osservato nel loop che termina un impulso viene consumato
-  mentre il motore e' ancora acceso; serve un fronte successivo.
-- Un fronte osservato a motore spento ha precedenza sul timeout,
-  anche a 200 ms esatti dall'ultimo spegnimento.
-
-Il numero di bloccaggi dipende dai fronti: per esempio possono servire
-2, 3 o 4 impulsi. Quando scadono 200 ms senza un nuovo fronte a motore
-spento, il controllo considera il freno arrestato e passa a `MANTENIMENTO`.
-La modalita' normale consente cosi' piu' accensioni per arrestare il freno.
-
-### Recupero della correzione positiva
-
-All'ingresso in `MOTOR_ON`, dopo aver aggiornato t_corr, il controllo
-sceglie il bloccaggio singolo (`S:1`) se entrambe le condizioni sono vere:
+All'ingresso in `MOTOR_ON`, il controllo aggiorna la correzione accumulata
+prima di decidere quando generare il primo bloccaggio:
 
 ```text
-t_corr > 0
-nel ciclo precedente il numero nominale di mantenimenti era zero
+Dt = ingresso MOTOR_ON attuale - ingresso MOTOR_ON precedente
+Corr += Dt - n_precedente * MS_PER_FRONTE
+Av = 1                              se Corr <= 0
+Av = 1 + ceil(Corr / MS_CORR_PER_FRONTE_ATTESO)   se Corr > 0
 ```
 
-Questo include finestre nulle e finestre inferiori ai 100 ms necessari
-per un mantenimento completo. Il primo ciclo parte in modalita' normale.
-La scelta resta fissata per tutto lo stato, anche se i nuovi fronti
-aumentano n e rendono nuovamente possibile il mantenimento.
+`MS_CORR_PER_FRONTE_ATTESO` vale inizialmente **600 ms**, come
+`MS_PER_FRONTE`, ma puo' essere regolato separatamente. `Av` e' il numero
+cumulativo di fronti necessario per la **prima** accensione del ciclo.
+Il fronte che ha causato l'ingresso e' gia' il numero 1.
 
-In S=1 si esegue un solo bloccaggio da 150 ms. I fronti durante HIGH e
-durante i successivi 200 ms vengono tutti contati, senza avviare altre
-accensioni o spostare il timeout. Lo stato termina 200 ms dopo lo
-spegnimento del primo impulso: nominalmente 350 ms dall'ingresso,
-anche se continuano ad arrivare fronti.
+| Corr all'ingresso | Primo bloccaggio |
+| --- | --- |
+| Negativa o zero | Primo fronte, subito nel main loop |
+| Da 1 a 600 ms | Secondo fronte |
+| Da 601 a 1200 ms | Terzo fronte |
+| 1400 ms | Quarto fronte |
+| 22675 ms | 39esimo fronte |
+| 23336 ms | 40esimo fronte |
+| 23789 ms | 41esimo fronte |
 
-Anche un fronte osservato nel loop della scadenza viene contato e
-consumato da MOTOR_ON; non viene inoltrato al nuovo stato. Un nuovo
-fronte dopo l'uscita puo' invece riavviare subito MOTOR_ON da mantenimento
-o attesa, secondo la logica consueta.
+`Av` resta invariato per tutto quel `MOTOR_ON`. Tutti i fronti in attesa
+vengono contati; al raggiungimento della soglia il motore si accende nello
+stesso loop che la osserva. Se piu' fronti erano gia' arrivati prima che il
+main reagisse, vengono tutti contati e possono soddisfare subito Av.
+Se la soglia non e' raggiunta, lo stato resta a motore spento: il timeout
+parte soltanto dalla fine del primo bloccaggio effettivamente generato.
 
-Il timeout in S=1 non conferma necessariamente l'arresto: serve a
-ridurre la frenata lasciando contare piu' fronti. Al prossimo ingresso,
-un n precedente maggiore aumenta il termine sottratto nella correzione,
-favorendo il recupero di t_corr positiva. Quando t_corr non e' piu'
-positiva, oppure il ciclo precedente prevede di nuovo mantenimenti,
-il nuovo MOTOR_ON torna in S=0 e puo' ripetere i bloccaggi.
+Un fronte durante un mantenimento puo' far entrare in `MOTOR_ON` mentre
+il motore e' HIGH. Se occorre aspettare Av, quel mantenimento viene spento
+subito. Con Av=1 il nuovo bloccaggio mantiene HIGH senza un passaggio LOW.
+L'ISR non accende il motore.
 
-Esempio simulato: con Corr=1400 ms e nessun mantenimento precedente,
-il bloccaggio singolo conta tre fronti in 350 ms. Al successivo ingresso
-dopo Dt=600 ms, la correzione diventa 1400+600-3*600=200 ms.
-Con altri tre fronti e una durata MOTOR_ON di 350 ms, la nuova finestra
-e' 1800-350-200=1250 ms e prevede due mantenimenti. Il ciclo successivo
-puo' quindi riprendere i bloccaggi multipli anche se Corr resta positiva.
+Questa strategia permette al freno di muoversi prima della prima frenata
+quando Corr e' positiva. Il maggiore n del ciclo contribuisce a ridurre
+la correzione al prossimo ingresso. Non si azzera artificialmente Corr.
+La scelta del bloccaggio singolo e il campo S della versione precedente
+sono stati sostituiti dall'avvio proporzionale, riconoscibile dal campo Av.
 
-## Conteggi e correzione accumulata
+## Bloccaggi dopo il raggiungimento di Av
 
-Il fronte che avvia `MOTOR_ON` appartiene al **nuovo** ciclo. `frontiMotorOn`
-conta questo fronte e tutti quelli successivi osservati nello stato,
-compresi quelli durante HIGH. Se piu' fronti sono gia' arrivati prima
-che il main loop reagisca, sono tutti assegnati al nuovo ciclo, ma
-avviano un solo impulso. Il conteggio viene congelato uscendo da `MOTOR_ON`.
+Ogni impulso dura `IMPULSO_BLOCCAGGIO_MS`, **150 ms** nel repository;
+il valore rimane parametrico. Alla fine il motore si spegne e riparte
+`MOTOR_ON_TIMEOUT_MS`, **200 ms**, dal suo spegnimento effettivo.
 
-Il primo fronte in mantenimento o attesa inizia il prossimo ciclo:
-non viene aggiunto al precedente. In questo modo ogni fronte valido
-appartiene a un solo ciclo. All'ingresso di `MOTOR_ON`:
+- I fronti durante HIGH vengono contati, senza prolungare l'impulso o
+  accodare altre accensioni.
+- Un nuovo fronte a motore spento genera un altro B, senza cambiare
+  Corr, Av o l'istante iniziale del ciclo.
+- Un fronte osservato nel loop che spegne B viene consumato mentre
+  il motore e' ancora acceso; serve un fronte successivo.
+- Un fronte a motore spento ha precedenza sulla scadenza dei 200 ms.
+
+Dopo il primo B, quindi, possono esserci altri bloccaggi anche con Corr
+positiva: il ritardo proporzionale riguarda il loro **avvio iniziale**.
+Quando il timeout scade senza nuovi fronti a motore spento, si passa a
+`MANTENIMENTO` e il conteggio del ciclo viene congelato.
+
+## Conteggi, tempi e mantenimento
+
+Ogni fronte appartiene a un solo ciclo. Il primo fronte in mantenimento
+o attesa appartiene al nuovo `MOTOR_ON`. `frontiMotorOn` comprende il
+fronte iniziale, quelli in attesa di Av e quelli durante tutti i bloccaggi.
+`Np` e' invece il conteggio congelato del MOTOR_ON precedente.
+Al primo ciclo non c'e' un campione precedente: Dt, Np e Corr sono zero.
+
+La correzione si aggiorna soltanto all'ingresso; resta invariata durante
+l'attesa, i bloccaggi e il mantenimento. Si conserva il segno. Un errore
+positivo la aumenta; un errore negativo la diminuisce.
+
+Alla fine del bloccaggio:
 
 ```text
-Dt = inizio MOTOR_ON attuale - inizio MOTOR_ON precedente
-n_precedente = fronti contati nel MOTOR_ON precedente
-t_corr += Dt - n_precedente * MS_PER_FRONTE
-n_attuale = fronti iniziali del nuovo MOTOR_ON
+On = ingresso MANTENIMENTO - ingresso MOTOR_ON
+t_m = max(n_attuale * MS_PER_FRONTE - On - Corr, 0)
 ```
 
-La correzione **si accumula**, come scelto per compensare il ritardo di
-sblocco. Al primo ciclo non esiste un Dt precedente: `Dt`, `Np` e `Corr`
-sono zero. I fronti del pregonfiaggio non entrano nel conteggio.
-Durante i successivi bloccaggi e il mantenimento, t_corr resta invariata.
+`On` e' il tempo completo nello stato: **attesa di Av, accensioni,
+pause e timeout finale**. Non e' la somma dei tempi HIGH.
+`tempoBloccaggioMs` mantiene quella somma come dato diagnostico.
+`t_m` e' una finestra temporale dall'ingresso in mantenimento.
 
-Se il ciclo precedente e' troppo lento, l'errore e' positivo: aumenta
-t_corr e accorcia la prossima finestra. Se e' troppo rapido, l'errore e'
-negativo: diminuisce t_corr e allunga la finestra. Si conserva il segno;
-una correzione negativa e' ammessa.
-
-La formula diretta `t_corr = Dt - n_precedente * MS_PER_FRONTE` sarebbe
-un errore di cadenza, anziche' una stima persistente del ritardo. Nel modello
-ideale con ritardo costante L e una finestra senza saturazioni:
+Il primo mantenimento parte all'ingresso se rimangono almeno 100 ms;
+i successivi partono ogni **600 ms fra avvii**, quindi 100 ms HIGH e
+500 ms LOW. Si avviano soltanto impulsi completi che terminano entro t_m:
 
 ```text
-Dt = n_precedente * MS_PER_FRONTE - t_corr_precedente + L
-t_corr_nuova = t_corr_precedente + Dt - n_precedente * MS_PER_FRONTE = L
+M = 0, se t_m < IMPULSO_MANTENIMENTO_MS
+M = 1 + floor((t_m - IMPULSO_MANTENIMENTO_MS) / INTERVALLO_MANTENIMENTO_MS), altrimenti
 ```
 
-La forma accumulata conserva quindi la compensazione quando il successivo
-errore e' zero; la forma diretta la azzererebbe, potendo alternare fra 0 e L.
+Alla scadenza si passa ad `ATTENDI_FRONTE`; se t_m e' zero il passaggio
+e' immediato. Un fronte encoder ha precedenza su tutte le scadenze e
+riavvia `MOTOR_ON` nel main loop. Con loop in ritardo si conservano almeno
+600 ms fra gli avvii effettivi, evitando raffiche di recupero; possono
+essere eseguiti meno mantenimenti di quelli nominali.
 
-## Finestra di mantenimento
+`Dt` e `On` partono dall'ingresso causato dal primo fronte del ciclo,
+anche se B parte piu' tardi. I timestamp del log `t` partono invece dal
+**primo B effettivo**: per questo la sua riga conserva t=0. `d` misura
+la distanza fra avvii effettivi, anche se qualche riga viene persa.
 
-Alla fine di `MOTOR_ON`, il controllo calcola:
+Esempio con Corr=600 ms: Av=2. Se il secondo fronte arriva 100 ms dopo
+l'ingresso, B parte allora; si spegne a 250 ms e il timeout termina a
+450 ms. Con n=2, t_m=1200-450-600=150 ms e M=1. Il mantenimento parte
+450 ms dall'ingresso, ma il suo log mostra t=350 ms dal primo B.
 
-```text
-durata_motor_on = ingresso MANTENIMENTO - ingresso MOTOR_ON
-t_m = max(n_attuale * MS_PER_FRONTE - durata_motor_on - t_corr, 0)
-```
+## Coerenza e limiti
 
-**durata_motor_on e' l'intero tempo nello stato:** comprende tutte le
-accensioni, le pause fra esse e il timeout finale di 200 ms.
-Sottrarre soltanto i tempi HIGH lascerebbe fuori queste attese dal periodo
-che si vuole regolare. `tempoBloccaggioMs` conserva la somma HIGH come dato
-diagnostico, ma non viene usata nella formula.
+La correzione accumulata regola la cadenza media. L'avvio e il mantenimento
+sono discreti, quindi possono produrre cicli alternati intorno all'obiettivo.
+L'obiettivo e' **600 ms per fronte accettato**; CHANGE conta salita e
+discesa, se entrambi superano il filtro.
 
-`t_m` misura una finestra temporale dal momento d'ingresso in
-`MANTENIMENTO`; non e' un budget di motore acceso. Il primo mantenimento
-parte all'ingresso, se rimangono almeno 100 ms. Gli altri partono ogni
-**600 ms fra avvii**, quindi nominalmente 100 ms HIGH e 500 ms LOW.
-L'intervallo e' parametrico e indipendente da `MS_PER_FRONTE`.
+Con carichi bassi, aspettare piu' fronti permette di recuperare una
+correzione positiva senza ripetere continuamente la prima frenata troppo
+presto. Il recupero dipende dai fronti e dalla risposta fisica effettivi:
+se il freno libero genera fronti piu' lentamente dell'obiettivo, il
+controllo non puo' crearne di aggiuntivi. Senza nuovi fronti durante
+l'attesa di Av, il motore resta spento.
 
-```text
-numero nominale = 0, se t_m < IMPULSO_MANTENIMENTO_MS
-altrimenti = 1 + floor((t_m - IMPULSO_MANTENIMENTO_MS) / INTERVALLO_MANTENIMENTO_MS)
-```
-
-Si avviano soltanto impulsi completi che possono terminare entro t_m.
-Se alla fine rimane meno di 100 ms, non si allunga o tronca un altro impulso.
-Dopo l'ultima accensione si rimane in `MANTENIMENTO` fino alla scadenza
-della finestra; poi si spegne e si passa a `ATTENDI_FRONTE`, senza ulteriori
-accensioni automatiche. Con t_m negativo o zero si passa subito all'attesa.
-
-Un fronte encoder ha precedenza su tutte le scadenze di mantenimento:
-interrompe la sequenza e riavvia subito `MOTOR_ON` nel main loop, anche
-durante HIGH o nel loop che raggiunge t_m. Se il motore e' gia' acceso,
-resta HIGH senza una commutazione LOW; il nuovo bloccaggio dura 150 ms
-dall'ingresso. Non c'e' una distanza minima fra questi riavvii.
-
-Con un loop in ritardo, gli avvii effettivi mantengono almeno 600 ms di
-distanza: non si recuperano gli impulsi persi con una raffica. La scadenza
-di t_m resta quella iniziale, quindi possono essere eseguiti meno impulsi
-del numero nominale. Spegnimenti e reazioni ai fronti avvengono al primo
-loop che li osserva; la macchina a stati non usa interrupt per i timer.
-
-Esempio al primo ciclo, con tre fronti che avviano bloccaggi a t=0, 170,
-340 ms: i tre impulsi da 150 ms terminano a t=490; il timeout termina a
-t=690. Con n=3 e t_corr=0, t_m=1800-690=1110 ms. I mantenimenti da 100 ms
-partono a t=690 e t=1290; a t=1800 il controllo passa a `ATTENDI_FRONTE`.
-La somma delle accensioni di bloccaggio e' 450 ms, ma il tempo da sottrarre
-e' 690 ms.
-
-## Coerenza e limiti del controllo
-
-La correzione accumulata regola la cadenza media: se non raggiunge i limiti,
-la somma degli errori di ciclo resta contenuta dalla correzione stessa.
-Il mantenimento introduce una quantizzazione: aggiungere o togliere un
-impulso sposta l'ultimo spegnimento di 600 ms. Sono quindi possibili cicli
-alternati intorno all'obiettivo, anche con ritardo di sblocco costante.
-`t_corr` compensa l'effetto complessivo misurato; il ritardo fisico dal
-vero ultimo spegnimento non coincide necessariamente con il tempo dalla
-fine della finestra, che puo' contenere una pausa finale.
-
-L'obiettivo e' **600 ms per fronte accettato**, non per impulso alto/basso:
-l'interrupt `CHANGE` conta entrambi i fronti, se superano il filtro.
-Per mantenere il freno bloccato, la pausa di 500 ms deve essere compatibile
-con il tempo di rilascio del sistema; se si sblocca prima, il fronte
-interrompe subito il mantenimento come previsto.
-
-Con t_m=0 non e' possibile abbreviare ulteriormente il ciclo tramite
-mantenimento. Il bloccaggio singolo riduce allora le accensioni ripetute
-quando la correzione resta positiva e mancano i mantenimenti. L'accumulo
-di t_corr rimane attivo; il recupero dipende dai fronti effettivamente
-ottenuti, senza azzeramenti artificiali della correzione. Se anche un
-solo impulso, il timeout e il rilascio richiedono piu' del tempo obiettivo,
-la correzione puo' ancora crescere: la possibilita' di regolare la cadenza
-dipende dalla risposta fisica del sistema.
-
-I prodotti e le differenze usano 64 bit con segno. La finestra viene
-limitata a `0..UINT32_MAX` ms, la correzione a `-UINT32_MAX..UINT32_MAX` ms,
-per restare nel campo dei timer. Non c'e' piu' il limite della vecchia
-richiesta di 2000 ms: i parametri di richiesta e Kp sono stati eliminati.
-I timer funzionano attraverso il rollover con intervalli inferiori a
-un giro completo di `millis()`; `encoderTotale` puo' attraversare il
-rollover nel conteggio di un ciclo. La somma diagnostica dei tempi HIGH
-satura a `UINT32_MAX`.
+I calcoli usano 64 bit con segno; Corr e' limitata al campo numerico
+`-UINT32_MAX..UINT32_MAX` ms, t_m a `0..UINT32_MAX` ms e Av a UINT32_MAX.
+I timer e il conteggio supportano il rollover con intervalli inferiori
+a un giro completo. Non viene ripristinato il vecchio limite di richiesta
+motore a 2000 ms.
 
 ## Parametri
 
 | Parametro | Valore iniziale | Significato |
 | --- | --- | --- |
 | `PRE_GONFIAGGIO_MS` | 1500 | Accensione iniziale |
-| `MOTOR_ON_TIMEOUT_MS` | 200 | Attesa dalla fine dell'ultimo bloccaggio |
-| `IMPULSO_BLOCCAGGIO_MS` | 150 | Durata di ciascun bloccaggio |
-| `IMPULSO_MANTENIMENTO_MS` | 100 | Durata di ciascun mantenimento |
+| `MOTOR_ON_TIMEOUT_MS` | 200 | Attesa dall'ultimo spegnimento B |
+| `IMPULSO_BLOCCAGGIO_MS` | 150 | Durata di ogni B |
+| `IMPULSO_MANTENIMENTO_MS` | 100 | Durata di ogni mantenimento |
 | `INTERVALLO_MANTENIMENTO_MS` | 600 | Distanza fra avvii di mantenimento |
-| `MS_PER_FRONTE` | 600 | Cadenza media obiettivo per fronte valido |
+| `MS_PER_FRONTE` | 600 | Cadenza media obiettivo |
+| `MS_CORR_PER_FRONTE_ATTESO` | 600 | Correzione per ogni fronte aggiuntivo prima di B |
 | `ENCODER_HOLDOFF_US` | 2000 | Tempo minimo fra fronti accettati |
 
 ## Collegamenti e ISR
@@ -268,7 +214,10 @@ questo campione con quello gia' letto nel main loop.
 ## Log e comandi seriali
 
 Monitor seriale a **115200 baud**. All'alimentazione o reset si stampa
-`Avvio freno`. Con o senza terminazione di riga:
+`Avvio freno - avvio proporzionale`, seguito dalla legenda dei campi.
+Questo testo permette di riconoscere il firmware caricato. La legenda
+specifica che tutti i tempi sono in ms e Corr viene sempre stampata con
+segno, positiva, zero o negativa. Con o senza terminazione di riga:
 
 | Comando | Effetto |
 | --- | --- |
@@ -279,33 +228,51 @@ Monitor seriale a **115200 baud**. All'alimentazione o reset si stampa
 campioni della precedente, senza ristampare `Avvio freno`. La lettura dei
 comandi e' limitata a otto caratteri per loop. Non si usa `delay()`.
 
-Il log dell'esempio con tre bloccaggi e n=3 e':
+Il log di un ciclo senza attesa iniziale, con tre bloccaggi e n=3, e':
 
 ```text
-B:1 Imp:150 t:         0 d:         0
-Dt:         0 Np:    0 Corr:+0 S:0
-B:2 Imp:150 t:       170 d:       170
-B:3 Imp:150 t:       340 d:       170
+B:1 Imp:150 Fr:    1 t:         0 d:         0
+Dt:         0 Np:    0 Corr:+0 Av:1
+B:2 Imp:150 Fr:    2 t:       170 d:       170
+B:3 Imp:150 Fr:    3 t:       340 d:       170
 Fr:    3 On:   690 Tm:  1110 M:2
 M:1/2 t:       690 d:       350
 M:2/2 t:      1290 d:       600
 ```
 
-- `B` numera i bloccaggi; `Imp` e' la durata parametrica.
-- `Dt`, `Np`, `Corr`, `S` compaiono soltanto all'ingresso in `MOTOR_ON`:
-  intervallo dal precedente ingresso, n precedente e correzione accumulata.
-  `S:1` indica bloccaggio singolo, `S:0` bloccaggi multipli consentiti.
-- `Fr`, `On`, `Tm`, `M` compaiono al termine del bloccaggio: n attuale,
-  tempo completo in MOTOR_ON, finestra t_m e numero nominale di mantenimenti.
-- `M:1/2` numera i mantenimenti avviati, senza ripetere Dt o Corr.
-- `t` riparte da zero al primo bloccaggio di ogni episodio.
-- `d` misura la distanza fra avvii effettivi; al primo bloccaggio vale
-  zero, al primo mantenimento si riferisce all'ultimo bloccaggio.
+| Campo | Significato |
+| --- | --- |
+| `Dt` | Tempo fra ingressi in MOTOR_ON, al primo fronte del ciclo |
+| `Np` | Fronti del MOTOR_ON precedente |
+| `Corr` | Correzione accumulata con segno, aggiornata all'ingresso |
+| `Av` | Fronte cumulativo richiesto per il primo B |
+| `B` | Numero dell'accensione di bloccaggio |
+| `Imp` | Durata HIGH parametrica del bloccaggio |
+| `Fr` | Fronti attuali sulla riga B; fronti finali sul riepilogo |
+| `On` | Tempo completo in MOTOR_ON, anche durante l'attesa e LOW |
+| `Tm` | Finestra temporale di mantenimento |
+| `M` | Numero nominale di mantenimenti; M:k/N indica il progressivo |
+| `t` | Tempo dal primo B effettivo, che vale zero sulla prima riga B |
+| `d` | Distanza fra avvii effettivi; sul primo B vale zero |
 
-Ogni riga viene inviata soltanto se entra interamente nella UART. Con
-spazio insufficiente, o campi molto grandi che superano il buffer,
-viene saltata senza attese. Timer e distanze restano corretti anche se una
-riga non viene stampata. Tutte le stampe sono fuori dall'ISR.
+Dt, Np, Corr e Av si stampano una sola volta all'ingresso. Quando Av>1,
+questa riga compare prima di B, mentre il motore aspetta i fronti.
+I mantenimenti non ripetono la correzione.
+
+Le righe vengono accodate in una coda di **quattro righe da massimo 63
+caratteri**. Alla fine del loop, dopo uscite e timer, la UART invia solo
+righe intere che entrano nello spazio disponibile. Se B riempie la UART,
+Corr rimane in coda per un loop successivo invece di essere scartata.
+Non si attende la seriale. Con congestione prolungata che riempie anche
+la coda, le nuove righe vengono saltate interamente; i log non alterano
+accensioni, timer o conteggi. Il testo di avvio si stampa solo in setup.
+
+Il log precedente riportato senza il campo S non coincide con la
+versione 4e91b33, che inibiva i B successivi con Corr positiva e M=0 nel
+ciclo precedente. Il marcatore di avvio e Av permettono di verificare
+che sia stata caricata la nuova strategia. Anche nella vecchia versione
+Corr aveva entrambi i segni, ma una riga poteva essere scartata per spazio
+UART insufficiente.
 
 ## Struttura e verifiche
 
@@ -337,25 +304,23 @@ La toolchain cloud e' Arduino CLI 1.4.1, megaAVR 1.8.8, API 1.3.1 e AVR GCC
 Debian 14.2.0, diverso dal compilatore del pacchetto Arduino standard.
 Il caricamento USB non e' verificato.
 
-I **40 gruppi di test** simulati coprono GPIO, pregonfiaggio diretto,
-debug/holdoff, ISR senza comandi motore, ONCE/ALWAYS, bloccaggi da 150 ms,
-due-quattro accensioni, fronti durante HIGH senza coda, timeout retriggerato
-allo spegnimento, fronti sulle scadenze, separazione dei conteggi fra cicli,
-correzione accumulata una sola volta, segno della correzione, tempo completo
-nello stato, impulsi da 100 ms ogni 600 ms, finestre corte e negative,
-interruzione del mantenimento, scadenza e attesa, loop in ritardo,
-rollover di tempo e contatore, calcoli a 64 bit, limiti numerici,
-stop/riavvio, seriale congestionata e log saltati. Le verifiche del
-bloccaggio singolo coprono condizioni d'ingresso, conteggio durante HIGH
-e LOW senza retrigger, fronte sulla scadenza, recupero della correzione
-e ritorno ai bloccaggi multipli, stop/riavvio, seriale congestionata e
-rollover di timer e contatore.
+I **45 gruppi di test** simulati coprono GPIO, ISR, filtro/holdoff,
+ONCE/ALWAYS, bloccaggi e timeout, conteggi separati, mantenimento regolare
+e interrompibile, formule e limiti, rollover, stop/riavvio e UART.
+Le verifiche dell'avvio proporzionale comprendono le soglie positive,
+zero e negative, il secondo/terzo fronte, i valori Corr del log riportato,
+assenza di timeout prima del primo B, fronti accumulati prima del main,
+attesa durante il mantenimento, bloccaggi multipli dopo Av e tempi del log.
+La UART viene simulata anche mentre si riempie: Corr negativa resta in
+coda dopo B e viene emessa appena c'e' spazio; la coda piena non blocca
+il controllo e non sovrascrive le righe pendenti.
 
-Un modello pneumatico semplificato, con quattro fronti per movimento e
-sblocco 800 ms dopo l'ultimo spegnimento, simula 100 cicli e misura
-**602 ms per fronte** in media rispetto all'obiettivo di 600 ms.
-Questo verifica la regolazione discreta nel modello; non prova la
-stabilita' o la risposta del prototipo reale.
+Nel modello a basso carico, il freno libero genera un fronte ogni 100 ms
+ed e' rilasciato 3000 ms dopo LOW. Su 300 cicli, la nuova strategia ottiene
+circa **601,6 ms per fronte** e mantiene la correzione massima a **3050 ms**.
+Il modello con quattro fronti per movimento e rilascio dopo 800 ms
+misura **600,8 ms per fronte** su 100 cicli. Sono risultati simulati;
+la risposta e la stabilita' del prototipo reale richiedono verifica hardware.
 
 ```sh
 set -e

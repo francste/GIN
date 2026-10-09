@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <util/atomic.h>
 #include <stdio.h>
+#include <string.h>
 
 // Parametri della prova.
 constexpr uint8_t MOTOR_PIN = 3;
@@ -10,12 +11,13 @@ constexpr uint32_t ENCODER_HOLDOFF_US = 2000;
 constexpr uint32_t PRE_GONFIAGGIO_MS = 1500;
 constexpr uint32_t MOTOR_ON_TIMEOUT_MS = 200;   // Dalla fine dell'ultimo impulso di bloccaggio.
 constexpr uint32_t MS_PER_FRONTE = 600;
+constexpr uint32_t MS_CORR_PER_FRONTE_ATTESO = MS_PER_FRONTE; // Ogni 600 ms positivi aspetta un fronte in piu'.
 constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 150;
 constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 100;
 constexpr uint32_t INTERVALLO_MANTENIMENTO_MS = 600; // Fra due avvii, indipendente dall'obiettivo.
 static_assert(IMPULSO_BLOCCAGGIO_MS > 0 && IMPULSO_MANTENIMENTO_MS > 0 &&
               INTERVALLO_MANTENIMENTO_MS > IMPULSO_MANTENIMENTO_MS &&
-              MOTOR_ON_TIMEOUT_MS > 0 && MS_PER_FRONTE > 0,
+              MOTOR_ON_TIMEOUT_MS > 0 && MS_PER_FRONTE > 0 && MS_CORR_PER_FRONTE_ATTESO > 0,
               "Servono durate positive e una pausa fra i mantenimenti");
 
 enum Stato { PRE_GONFIAGGIO, ATTENDI_FRONTE, MOTOR_ON, MANTENIMENTO, FERMO };
@@ -40,7 +42,8 @@ int64_t correzioneTempoMs = 0;                // t_corr accumulata, anche negati
 uint32_t durataMotorOnMs = 0;                 // Tempo nello stato, accensioni + pause + timeout.
 
 bool bloccaggioAcceso = false;
-bool soloPrimoBloccaggio = false;             // Modalita' fissata all'ingresso in MOTOR_ON.
+uint32_t fronteAvvioBloccaggio = 1;           // Fronte atteso per il primo B, fissato all'ingresso.
+uint32_t inizioBloccaggioMs = 0;              // Zero del log t, distinto dall'ingresso in MOTOR_ON.
 uint32_t numeroBloccaggi = 0;
 uint32_t tempoBloccaggioMs = 0;                // Somma dei tempi effettivamente accesi.
 uint32_t inizioImpulsoMs = 0;
@@ -52,6 +55,12 @@ uint32_t numeroMantenimenti = 0;
 uint32_t indiceMantenimento = 0;               // Numero di mantenimenti avviati.
 uint32_t durataMantenimentoMs = 0;            // t_m: durata della finestra, non somma degli HIGH.
 uint32_t inizioMantenimentoMs = 0;
+
+// Quattro righe in attesa: evita di perdere Corr quando B ha appena riempito la UART.
+struct RigaLog { char testo[64]; uint8_t lunghezza; };
+RigaLog codaLog[4];
+uint8_t primaRigaLog = 0;
+uint8_t righeLogInAttesa = 0;
 
 void encoderISR() {
   // Il debug copia anche i rimbalzi che il filtro scarta.
@@ -72,18 +81,32 @@ uint32_t leggiEncoder() {
 }
 
 void inviaLog(const char *riga, int lunghezza, size_t capacita) {
-  // Non attendere mai la UART: invia soltanto righe complete che entrano nel buffer.
-  if (lunghezza > 0 && size_t(lunghezza) < capacita &&
-      Serial.availableForWrite() >= lunghezza) Serial.print(riga);
+  if (lunghezza <= 0 || size_t(lunghezza) >= capacita ||
+      size_t(lunghezza) >= sizeof(codaLog[0].testo) || righeLogInAttesa == 4) return;
+  RigaLog &destinazione = codaLog[(primaRigaLog + righeLogInAttesa) % 4];
+  memcpy(destinazione.testo, riga, size_t(lunghezza) + 1);
+  destinazione.lunghezza = uint8_t(lunghezza);
+  ++righeLogInAttesa;                          // Accoda la riga intera, senza scrivere sulla UART.
+}
+
+void svuotaLog() {
+  while (righeLogInAttesa > 0) {
+    const RigaLog &riga = codaLog[primaRigaLog];
+    if (Serial.availableForWrite() < riga.lunghezza) break;
+    Serial.print(riga.testo);                 // Scrive soltanto quando entra la riga intera.
+    primaRigaLog = (primaRigaLog + 1) % 4;
+    --righeLogInAttesa;
+  }
 }
 
 void stampaBloccaggio() {
   char riga[96];
   const uint32_t distanzaMs = numeroBloccaggi == 1 ? 0 :
                               uint32_t(inizioImpulsoMs - ultimoImpulsoMs);
-  const int lunghezza = snprintf(riga, sizeof(riga), "B:%lu Imp:%3u t:%10lu d:%10lu\n",
+  const int lunghezza = snprintf(riga, sizeof(riga), "B:%lu Imp:%3u Fr:%5lu t:%10lu d:%10lu\n",
                                 (unsigned long)numeroBloccaggi, unsigned(IMPULSO_BLOCCAGGIO_MS),
-                                (unsigned long)uint32_t(inizioImpulsoMs - inizioSequenzaMs),
+                                (unsigned long)frontiMotorOn,
+                                (unsigned long)uint32_t(inizioImpulsoMs - inizioBloccaggioMs),
                                 (unsigned long)distanzaMs);
   ultimoImpulsoMs = inizioImpulsoMs;            // Aggiorna anche se il log e' saltato.
   inviaLog(riga, lunghezza, sizeof(riga));
@@ -98,9 +121,9 @@ void stampaIntervallo() {
   do { *--cifra = char('0' + valore % 10); valore /= 10; } while (valore > 0);
   *--cifra = correzioneTempoMs < 0 ? '-' : '+';
   char riga[96];
-  const int lunghezza = snprintf(riga, sizeof(riga), "Dt:%10lu Np:%5lu Corr:%s S:%u\n",
+  const int lunghezza = snprintf(riga, sizeof(riga), "Dt:%10lu Np:%5lu Corr:%s Av:%lu\n",
                                 (unsigned long)ultimoPeriodoMs,
-                                (unsigned long)frontiPrecedenti, cifra, unsigned(soloPrimoBloccaggio));
+                                (unsigned long)frontiPrecedenti, cifra, (unsigned long)fronteAvvioBloccaggio);
   inviaLog(riga, lunghezza, sizeof(riga));
 }
 
@@ -117,7 +140,7 @@ void stampaMantenimento() {
   char riga[96];
   const int lunghezza = snprintf(riga, sizeof(riga), "M:%lu/%lu t:%10lu d:%10lu\n",
                                 (unsigned long)indiceMantenimento, (unsigned long)numeroMantenimenti,
-                                (unsigned long)uint32_t(inizioImpulsoMs - inizioSequenzaMs),
+                                (unsigned long)uint32_t(inizioImpulsoMs - inizioBloccaggioMs),
                                 (unsigned long)uint32_t(inizioImpulsoMs - ultimoImpulsoMs));
   ultimoImpulsoMs = inizioImpulsoMs;
   inviaLog(riga, lunghezza, sizeof(riga));
@@ -135,11 +158,19 @@ uint32_t limitaDurataMs(int64_t durataMs) {
   return uint32_t(durataMs);
 }
 
+uint32_t calcolaFronteAvvio(int64_t correzioneMs) {
+  if (correzioneMs <= 0) return 1;             // Primo fronte: bloccaggio immediato.
+  const uint64_t fronti = 1 + (uint64_t(correzioneMs) + MS_CORR_PER_FRONTE_ATTESO - 1) /
+                            MS_CORR_PER_FRONTE_ATTESO;
+  return fronti > UINT32_MAX ? UINT32_MAX : uint32_t(fronti);
+}
+
 void accendiBloccaggio() {
   digitalWrite(MOTOR_PIN, HIGH);
   inizioImpulsoMs = millis();
   bloccaggioAcceso = true;
   ++numeroBloccaggi;
+  if (numeroBloccaggi == 1) inizioBloccaggioMs = inizioImpulsoMs;
 }
 
 void memorizzaIntervallo(uint32_t primaDeiFronti) {
@@ -195,7 +226,9 @@ void aggiornaFreno(uint32_t now) {
           durataMotorOnMs = durataMantenimentoMs = 0;
           numeroBloccaggi = tempoBloccaggioMs = 0;
           numeroMantenimenti = indiceMantenimento = 0;
-          bloccaggioAcceso = mantenimentoAcceso = soloPrimoBloccaggio = false;
+          bloccaggioAcceso = mantenimentoAcceso = false;
+          fronteAvvioBloccaggio = 1;
+          inizioBloccaggioMs = 0;
           inizioStatoMs = now;
           digitalWrite(MOTOR_PIN, HIGH);
         }
@@ -221,24 +254,26 @@ void aggiornaFreno(uint32_t now) {
         break;
 
       case MOTOR_ON:
-        if (once) {                            // ONCE: primo impulso, nuovo timer e Dt congelato.
-          const bool senzaMantenimentiPrima = precedenteSequenzaValida && numeroMantenimenti == 0;
-          mantenimentoAcceso = false;
+        if (once) {                            // ONCE: nuovo timer, Dt e n; decidi il fronte di avvio.
+          bloccaggioAcceso = mantenimentoAcceso = false;
           numeroBloccaggi = tempoBloccaggioMs = 0;
           numeroMantenimenti = indiceMantenimento = 0;
           durataMotorOnMs = durataMantenimentoMs = 0;
-          accendiBloccaggio();
-          inizioSequenzaMs = inizioStatoMs = inizioImpulsoMs;
+          inizioSequenzaMs = inizioStatoMs = millis();
           memorizzaIntervallo(primaDeiFronti);
-          // Riduci la frenata se la correzione positiva ha gia' escluso il mantenimento.
-          soloPrimoBloccaggio = senzaMantenimentiPrima && correzioneTempoMs > 0;
-          stampaBloccaggio();
-          stampaIntervallo();                  // t_corr si aggiorna soltanto all'ingresso.
-          nuovoFronte = false;
-          now = millis();
+          fronteAvvioBloccaggio = calcolaFronteAvvio(correzioneTempoMs);
+          // Durante l'attesa spegni anche un eventuale mantenimento ancora HIGH.
+          if (frontiMotorOn < fronteAvvioBloccaggio) digitalWrite(MOTOR_PIN, LOW);
         }
-        // In modalita' singola i fronti aggiornano n, ma non riaccendono o passano al nuovo stato.
-        if (soloPrimoBloccaggio) nuovoFronte = false;
+        // ALWAYS: prima del primo B conta tutti i fronti, senza far partire il timeout.
+        if (numeroBloccaggi == 0) {
+          if (frontiMotorOn >= fronteAvvioBloccaggio) {
+            accendiBloccaggio();
+            stampaBloccaggio();
+          }
+          if (once) stampaIntervallo();        // Corr positiva, zero o negativa: una volta per ciclo.
+          break;
+        }
         // ALWAYS: un fronte durante HIGH si conta, ma non accoda un altro impulso.
         if (bloccaggioAcceso) {
           if (uint32_t(now - inizioImpulsoMs) >= IMPULSO_BLOCCAGGIO_MS) {
@@ -310,6 +345,7 @@ void leggiComandi() {
 }
 
 void setup() {
+  primaRigaLog = righeLogInAttesa = 0;
   // Ingressi fisici fuori dalla mappatura Arduino: buffer attivo, senza pull-up o interrupt.
   PORTD.DIRCLR = PIN6_bm; PORTD.PIN6CTRL = 0;  // PD6.
   PORTA.DIRCLR = PIN6_bm; PORTA.PIN6CTRL = 0;  // PA6.
@@ -329,7 +365,14 @@ void setup() {
   digitalWrite(DEBUG_PIN, digitalRead(ENCODER_PIN));
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, CHANGE);
   Serial.begin(115200);
-  Serial.println("Avvio freno");
+  Serial.println(F("Avvio freno - avvio proporzionale"));
+  Serial.println(F("Log: tempi in ms; Corr sempre con segno."));
+  Serial.println(F("Dt=tra ingressi MOTOR_ON; Np=fronti ciclo precedente."));
+  Serial.println(F("Corr=correzione accumulata; Av=fronte del primo B."));
+  Serial.println(F("B=bloccaggio; Imp=durata HIGH; Fr=fronti del ciclo."));
+  Serial.println(F("On=tempo MOTOR_ON con attesa/pause; Tm=mantenimento."));
+  Serial.println(F("M=impulsi mantenimento previsti; M:k/N=progressivo."));
+  Serial.println(F("t=dal primo B; d=tra avvii; s=stop; a=riavvio."));
   cambiaStato(PRE_GONFIAGGIO);
   aggiornaFreno(millis());                    // Esegue subito il once iniziale.
 }
@@ -337,4 +380,5 @@ void setup() {
 void loop() {
   leggiComandi();                             // Lo stop viene eseguito in questo loop.
   aggiornaFreno(millis());
+  svuotaLog();                                // Uscite e timer hanno precedenza sui log.
 }

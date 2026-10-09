@@ -86,6 +86,7 @@ class MockSerial : public Print {
   std::deque<char> input;
   std::string output;
   bool txBlocked = false;
+  bool consumeTxSpace = false;                // Per simulare la coda TX che si riempie.
   int txSpace = 64;
   void begin(unsigned long) {}
   int available() { return int(input.size()); }
@@ -93,6 +94,10 @@ class MockSerial : public Print {
   int availableForWrite() { return txBlocked ? 0 : txSpace; }
   size_t write(uint8_t value) override {
     if (txBlocked) throw std::runtime_error("scrittura UART bloccante durante il controllo");
+    if (consumeTxSpace) {
+      if (txSpace <= 0) throw std::runtime_error("scrittura UART oltre lo spazio disponibile");
+      --txSpace;
+    }
     output.push_back(char(value));
     return 1;
   }
