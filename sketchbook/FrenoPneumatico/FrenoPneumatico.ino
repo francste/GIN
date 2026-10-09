@@ -13,7 +13,7 @@ constexpr uint32_t MS_PER_FRONTE = 600;
 constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 150; // Prima accensione di ogni sequenza.
 constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 70;
 constexpr uint16_t RICHIESTA_INIZIALE_MS = 200;
-constexpr uint16_t PASSO_MS = 20;
+constexpr uint16_t KP_PER_MILLE = 100;         // Kp = 0,10 ms di correzione per ms di errore medio.
 constexpr uint16_t RICHIESTA_MINIMA_MS = 50;
 constexpr uint16_t RICHIESTA_MASSIMA_MS = 400;
 static_assert(IMPULSO_BLOCCAGGIO_MS > 0 && IMPULSO_BLOCCAGGIO_MS <= RICHIESTA_MASSIMA_MS &&
@@ -30,6 +30,7 @@ uint32_t inizioSequenzaMs = 0;
 uint16_t numeroImpulsi = 1;
 uint16_t indiceImpulso = 0;                    // 0 = prima accensione della sequenza.
 bool mantenimentoAcceso = false;
+uint32_t ultimoImpulsoMs = 0;                  // Accensione precedente, anche se il log e' saltato.
 
 // Campioni presi a ogni inizio sequenza: le accensioni intermedie non li cambiano.
 volatile uint32_t encoderTotale = 0;
@@ -85,16 +86,19 @@ void stampaImpulso(int16_t correzioneMs) {
   if (indiceImpulso == 0) {
     // Solo il bloccaggio ha il campione completo e la correzione della richiesta.
     lunghezza = snprintf(riga, sizeof(riga),
-                         "Imp:%3u Corr:%+3d Dt:%10lu Fr:%10lu Req:%3u N:%3u/%3u\n",
+                         "Imp:%3u Corr:%+4d Dt:%10lu Fr:%5lu Req:%3u %u/%u t:0\n",
                          unsigned(durataImpulsoMs()), int(correzioneMs),
                          (unsigned long)ultimoPeriodoMs,
                          (unsigned long)frontiPeriodo, unsigned(tempoRichiestoMs),
                          unsigned(indiceImpulso + 1), unsigned(numeroImpulsi));
   } else {
-    // Mantenimento: stampa soltanto il progressivo nella sequenza.
-    lunghezza = snprintf(riga, sizeof(riga), "%u/%u\n",
-                         unsigned(indiceImpulso + 1), unsigned(numeroImpulsi));
+    // t parte dal bloccaggio; d e' la distanza dall'accensione precedente.
+    lunghezza = snprintf(riga, sizeof(riga), "%u/%u t:%10lu d:%10lu\n",
+                         unsigned(indiceImpulso + 1), unsigned(numeroImpulsi),
+                         (unsigned long)uint32_t(inizioStatoMs - inizioSequenzaMs),
+                         (unsigned long)uint32_t(inizioStatoMs - ultimoImpulsoMs));
   }
+  ultimoImpulsoMs = inizioStatoMs;             // Misura accensioni reali, non righe stampate.
   // Nessuna attesa per la UART: stampa solo se entra l'intera riga.
   if (lunghezza > 0 && lunghezza < int(sizeof(riga)) &&
       Serial.availableForWrite() >= lunghezza) Serial.print(riga);
@@ -112,19 +116,30 @@ void cambiaStato(Stato nuovoStato) {
   ingressoStato = true;
 }
 
+uint16_t limitaRichiestaMs(int64_t richiestaMs) {
+  if (richiestaMs < RICHIESTA_MINIMA_MS) return RICHIESTA_MINIMA_MS;
+  if (richiestaMs > RICHIESTA_MASSIMA_MS) return RICHIESTA_MASSIMA_MS;
+  return uint16_t(richiestaMs);
+}
+
+int64_t correzioneProporzionaleMs(uint32_t periodoMs, uint32_t fronti) {
+  if (fronti == 0) return 0;                   // Nessun tempo medio misurabile.
+  // Corr = Kp * (600 - Dt/fronti). Calcolo intero senza troncare prima la media.
+  const int64_t erroreMs = int64_t(MS_PER_FRONTE) * fronti - periodoMs;
+  const int64_t numeratore = erroreMs * KP_PER_MILLE;
+  const int64_t denominatore = int64_t(fronti) * 1000;
+  // Arrotonda al ms piu' vicino, in entrambe le direzioni.
+  return (numeratore + (numeratore >= 0 ? denominatore / 2 : -denominatore / 2)) /
+         denominatore;
+}
+
 void preparaSequenza(uint32_t now, uint32_t totale) {
   if (precedenteSequenzaValida) {
     ultimoPeriodoMs = uint32_t(now - precedenteSequenzaMs);
     frontiPeriodo = uint32_t(totale - totaleAllaSequenza);
-    const uint64_t tempoObiettivoMs = uint64_t(frontiPeriodo) * MS_PER_FRONTE;
-
-    // Lento: meno gonfiaggio. Rapido: piu' gonfiaggio. Uguale: nessuna modifica.
-    int32_t nuovaRichiestaMs = tempoRichiestoMs;
-    if (ultimoPeriodoMs > tempoObiettivoMs) nuovaRichiestaMs -= PASSO_MS;
-    else if (ultimoPeriodoMs < tempoObiettivoMs) nuovaRichiestaMs += PASSO_MS;
-    if (nuovaRichiestaMs < RICHIESTA_MINIMA_MS) nuovaRichiestaMs = RICHIESTA_MINIMA_MS;
-    if (nuovaRichiestaMs > RICHIESTA_MASSIMA_MS) nuovaRichiestaMs = RICHIESTA_MASSIMA_MS;
-    tempoRichiestoMs = uint16_t(nuovaRichiestaMs);
+    // Lento: meno gonfiaggio. Rapido: piu' gonfiaggio. Correzione proporzionale all'errore.
+    const int64_t correzioneMs = correzioneProporzionaleMs(ultimoPeriodoMs, frontiPeriodo);
+    tempoRichiestoMs = limitaRichiestaMs(int64_t(tempoRichiestoMs) + correzioneMs);
   }
   precedenteSequenzaMs = inizioSequenzaMs = now;
   totaleAllaSequenza = totale;
@@ -172,12 +187,13 @@ void aggiornaFreno(uint32_t now) {
     switch (stato) {
       case PRE_GONFIAGGIO:
         if (once) {                            // ONCE: prepara una nuova prova.
-          tempoRichiestoMs = RICHIESTA_INIZIALE_MS;
+          tempoRichiestoMs = limitaRichiestaMs(RICHIESTA_INIZIALE_MS);
           precedenteSequenzaValida = false;
           ultimoPeriodoMs = frontiPeriodo = 0;
           indiceImpulso = 0;
           numeroImpulsi = 1;
           mantenimentoAcceso = false;
+          ultimoImpulsoMs = 0;
           inizioSequenzaMs = 0;
           inizioStatoMs = now;
           digitalWrite(MOTOR_PIN, HIGH);
@@ -248,7 +264,7 @@ void aggiornaFreno(uint32_t now) {
             if (!bloccaggioRichiesto) {
               digitalWrite(MOTOR_PIN, HIGH);
               mantenimentoAcceso = true;
-              inizioStatoMs = now;
+              inizioStatoMs = millis();       // Timestamp dell'accensione effettiva.
             }
           }
           if (mantenimentoAcceso) stampaImpulso(0);

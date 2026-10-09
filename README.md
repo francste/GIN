@@ -113,19 +113,45 @@ all'ingresso di `MOTOR_ON`, anche se interrompe un mantenimento. Dal secondo
 avvio si calcolano sullo stesso intervallo:
 
 ```text
-T = Dt
 n = contatore attuale - contatore all'inizio della sequenza precedente
-obiettivo = n * 600 ms
+tempo medio per fronte = Dt / n
+errore medio = 600 ms - tempo medio per fronte
+Kp = KP_PER_MILLE / 1000 = 0,10
 
-T > obiettivo  -> tempo richiesto diminuisce di 20 ms
-T < obiettivo  -> tempo richiesto aumenta di 20 ms
-T = obiettivo  -> tempo richiesto invariato
+correzione = arrotonda(Kp * errore medio)
+richiesta = limita(richiesta precedente + correzione, minimo, massimo)
 ```
 
+La correzione e' proporzionale allo scostamento del tempo medio rispetto
+ai 600 ms obiettivo: media inferiore (movimento rapido) aumenta la richiesta;
+media superiore (movimento lento) la diminuisce. Si aggiorna la richiesta
+precedente, senza un passo fisso. Con `KP_PER_MILLE = 100`, un errore di
+100 ms produce 10 ms di correzione; un errore di 300 ms ne produce 30.
+Per attenuare la regolazione si puo' ridurre `KP_PER_MILLE`, per esempio a
+50 (Kp = 0,05). Il guadagno va verificato sul prototipo.
+
+Il calcolo intero usa prodotti a 64 bit e conserva la frazione di `Dt/n`
+fino all'arrotondamento finale al millisecondo piu' vicino, simmetrico nei
+due versi. Correzioni inferiori a mezzo millisecondo arrotondano a zero;
+con `n = 0` non viene applicata correzione.
+
+Esempi dai campioni misurati, prima dei limiti della richiesta:
+
+| Dt (ms) | Fronti | Media (ms/fronte) | Correzione (ms) |
+| --- | --- | --- | --- |
+| 3340 | 8 | 417,5 | +18 |
+| 2867 | 14 | 204,8 | +40 |
+| 3738 | 4 | 934,5 | -33 |
+| 2865 | 47 | 61,0 | +54 |
+| 5059 | 5 | 1011,8 | -41 |
+
 La richiesta resta tra **50 e 400 ms**, con valore iniziale **200 ms**.
-Una riduzione da 60 a 50 ms vale -10 ms per rispettare il limite minimo.
+Anche il valore iniziale viene limitato: impostare 500 ms con massimo
+400 ms avvia direttamente a 400 ms. Nel log `Corr` indica la variazione
+effettiva dopo i limiti: a 400 ms un incremento richiesto mostra `Corr:+0`,
+mentre una riduzione puo' ancora essere applicata.
 La nuova richiesta viene subito convertita nel numero di accensioni della
-sequenza. Una correzione di 20 ms puo' lasciare invariato il numero di
+sequenza. Una correzione puo' lasciare invariato il numero di
 mantenimenti, perche' il residuo viene diviso in accensioni intere da 70 ms.
 
 `n` include tutti i fronti accettati dopo il campione della sequenza
@@ -133,7 +159,7 @@ precedente, durante accensioni e attese, compreso quello che avvia la nuova
 sequenza. Il fronte che aveva avviato la precedente e' gia' nel campione
 iniziale e non viene contato nuovamente. I fronti del pregonfiaggio non
 influenzano la correzione. Contatore e `millis()` usano sottrazioni unsigned
-per gestire il loro rollover; l'obiettivo `n * 600` usa 64 bit.
+per gestire il loro rollover; il calcolo proporzionale usa 64 bit.
 
 ## Parametri e struttura locale
 
@@ -149,7 +175,7 @@ I parametri sono all'inizio del `.ino`:
 | `IMPULSO_BLOCCAGGIO_MS` | 150 | Prima accensione di ogni sequenza |
 | `IMPULSO_MANTENIMENTO_MS` | 70 | Accensioni successive distribuite su Dt |
 | `RICHIESTA_INIZIALE_MS` | 200 | Tempo totale richiesto iniziale |
-| `PASSO_MS` | 20 | Correzione della richiesta per sequenza |
+| `KP_PER_MILLE` | 100 | Guadagno proporzionale: 100 corrisponde a Kp = 0,10 |
 | `RICHIESTA_MINIMA_MS` | 50 | Richiesta minima |
 | `RICHIESTA_MASSIMA_MS` | 400 | Richiesta massima |
 
@@ -226,25 +252,35 @@ campioni della precedente. I timer degli stati usano `millis()` e il filtro
 encoder usa `micros()`, senza `delay()`.
 
 Il log stampa `Avvio freno` all'alimentazione o reset, poi una riga a ogni
-avvio di bloccaggio e a ogni accensione di mantenimento. Esempio di una sequenza: richiesta di 300 ms
-distribuita su un periodo di 2000 ms, con correzione -20 ms all'inizio:
+avvio di bloccaggio e a ogni accensione di mantenimento. Esempio: richiesta
+precedente di 340 ms, `Dt = 2000 ms`, 2 fronti. La media e' 1000 ms;
+la correzione di -40 ms porta la richiesta a 300 ms:
 
 ```text
-Imp:150 Corr:-20 Dt:      2000 Fr:         1 Req:300 N:  1/  3
-2/3
-3/3
+Imp:150 Corr: -40 Dt:      2000 Fr:    2 Req:300 1/3 t:0
+2/3 t:       666 d:       666
+3/3 t:      1333 d:       667
 ```
 
 I primi campi restano nell'ordine impulso, correzione, tempo dal precedente
-avvio di sequenza, fronti. `Imp`, `Corr`, `Dt` e `Req` sono in millisecondi.
+avvio di sequenza, fronti. `Imp`, `Corr`, `Dt`, `Req`, `t` e `d` sono in millisecondi.
 La riga completa viene stampata solo sul primo impulso, quello di bloccaggio.
 `Imp` e' la sua durata di 150 ms; `Req` e' il tempo totale richiesto dal
-regolatore; `N` indica l'accensione attuale e il numero totale. Le colonne
-hanno larghezze fisse; la riga completa occupa 63 byte, incluso il newline.
-Per ogni mantenimento si stampa soltanto il progressivo, per esempio `2/3`
-e `3/3`: la numerazione include il bloccaggio iniziale, gia' indicato come `1/3`.
+regolatore; `1/3` indica l'accensione attuale e il numero totale, senza il
+prefisso `N:`. `Imp`, `Corr`, `Dt`, `Fr` e `Req` hanno larghezze minime fisse.
+La riga tipica occupa 57 byte e, con i parametri attuali, al massimo 62,
+incluso il newline: entra nel buffer UART anche con contatori a 10 cifre.
+Per ogni mantenimento si stampano il progressivo, `t` e `d`:
+
+- `t` e' il tempo dall'avvio del bloccaggio della sequenza corrente, dove
+  riparte da zero; usa il timestamp effettivo dell'accensione.
+- `d` e' la distanza dall'accensione precedente, compreso il bloccaggio
+  per il primo mantenimento. Misura le accensioni fisiche anche quando
+  una loro riga non e' stata stampata.
+
+La numerazione include il bloccaggio iniziale, gia' indicato come `1/3`.
 Se un fronte interrompe il mantenimento, compare una nuova riga completa
-con `N:1/...`, `Dt`, `Fr` e correzione della nuova sequenza; i progressivi
+con `1/...`, `t:0`, `Dt`, `Fr` e correzione della nuova sequenza; i progressivi
 ancora previsti per la vecchia sequenza non vengono stampati.
 
 `Corr` mostra la variazione effettiva della richiesta, calcolata e applicata
@@ -255,7 +291,7 @@ Il conteggio in corso continua
 nell'ISR e sara' campionato all'inizio della sequenza successiva.
 
 La prima sequenza stampa `Imp:150`, `Dt:0`, `Fr:0`, `Corr:+0`, `Req:200` e
-`N:1/1`, con spazi per allineare i campi. Anche dopo `a` riparte cosi', senza ripetere
+`1/1 t:0`, con spazi per allineare i campi. Anche dopo `a` riparte cosi', senza ripetere
 la stringa di avvio. Il pregonfiaggio da 1500 ms non genera righe impulso.
 Non ci sono messaggi periodici o di cambio stato.
 
@@ -294,16 +330,20 @@ AVR GCC Debian 14.2.0, diverso da quello del pacchetto Arduino standard.
 Gli indici remoti e i tool di discovery non disponibili non impediscono
 la compilazione con il core locale. Il caricamento USB non e' verificato.
 
-I test verificano 27 gruppi: GPIO e prima sequenza, debug/holdoff,
+I test verificano 31 gruppi: GPIO e prima sequenza, debug/holdoff,
 rollover di `micros()`, ONCE, pregonfiaggio da 1500 ms e attesa iniziale fissa,
 bloccaggio da 150 ms e due mantenimenti da 70 ms con richiesta di 300 ms su
 2000 ms, interruzione del mantenimento in pausa e durante l'accensione,
-precedenza del fronte sulle scadenze, assenza di timeout operativo, correzione,
+precedenza del fronte sulle scadenze, assenza di timeout operativo,
+correzione proporzionale sui campioni misurati, media per fronte e
+arrotondamento simmetrico, limiti e contatori grandi,
 distribuzione con intervalli frazionari, timestamp e conteggio congelati nell'ISR,
 fronte arrivato dopo la lettura dell'orologio del loop,
 loop in ritardo, limiti della richiesta, stop/riavvio durante accensione
 e pausa, stop con richiesta ISR pendente, rollover di `millis()` e del contatore, periodi lunghi con prodotti
 a 64 bit, seriale congestionata, log di ogni accensione e spazio UART,
+timestamp e distanze effettive anche con righe saltate e loop in ritardo,
+righe con contatori e timestamp a 10 cifre entro il buffer da 63 byte,
 soglia stretta di mantenimento a 220 ms, distanza sufficiente per il
 bloccaggio con periodi brevi.
 

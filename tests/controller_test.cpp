@@ -75,19 +75,19 @@ static Trace observe(uint64_t from, uint64_t until,
   return trace;
 }
 
-static void first_sequence() {
+static void first_sequence(unsigned frontiExtra = 0) {
   reset(); ready(); edge(3000);
+  for (unsigned i = 0; i < frontiExtra; ++i) edge(3002 + i * 2);
   tick(3149); assert(hardware::levels[3] == HIGH);
   tick(3150); assert(hardware::levels[3] == LOW && stato == MANTENIMENTO);
   assert(encoderPronto);
   tick(3449); tick(3450); assert(stato == MANTENIMENTO);
 }
 
-// Precondizione: il regolatore ha gia' raggiunto 320 ms di richiesta.
-// Un periodo lento di 2000 ms la porta a 300 ms: l'esempio richiesto dall'utente.
+// Dt=2000, n=2: tempo medio 1000 ms, Corr=-40. Richiesta da 340 a 300 ms.
 static void example_sequence() {
-  first_sequence(); tempoRichiestoMs = 320; edge(5000);
-  assert(tempoRichiestoMs == 300 && ultimoPeriodoMs == 2000 && frontiPeriodo == 1);
+  first_sequence(1); tempoRichiestoMs = 340; edge(5000);
+  assert(tempoRichiestoMs == 300 && ultimoPeriodoMs == 2000 && frontiPeriodo == 2);
 }
 
 static void startup_and_inputs_without_pullup() {
@@ -181,8 +181,8 @@ static void edge_in_gap_cancels_maintenance_and_blocks_in_isr() {
   assert(bloccaggioRichiesto && !encoderPronto && Serial.output.empty());
   tick(5200);
   assert(stato == MOTOR_ON && precedenteSequenzaMs == 5200);
-  assert(ultimoPeriodoMs == 200 && frontiPeriodo == 1 && tempoRichiestoMs == 320);
-  assert(Serial.output == "Imp:150 Corr:+20 Dt:       200 Fr:         1 Req:320 N:  1/  1\n");
+  assert(ultimoPeriodoMs == 200 && frontiPeriodo == 1 && tempoRichiestoMs == 340);
+  assert(Serial.output == "Imp:150 Corr: +40 Dt:       200 Fr:    1 Req:340 1/1 t:0\n");
   tick(5349); assert(hardware::levels[3] == HIGH);
   tick(5350); assert(stato == MANTENIMENTO && hardware::levels[3] == LOW);
   const Trace trace = observe(5351, 6703);
@@ -194,20 +194,21 @@ static void edge_during_on_maintenance_keeps_high_for_new_block() {
   example_sequence(); tick(5150); Serial.output.clear();
   const Trace trace = observe(5666, 6500, {5700});
   // 34 ms di mantenimento gia' trascorsi + 150 ms dal nuovo fronte, senza spegnimento.
-  assert(trace.starts == std::vector<uint64_t>({5666, 6050}));
-  assert(trace.lengths == std::vector<uint64_t>({184, 70}));
+  assert(trace.starts == std::vector<uint64_t>({5666, 5933, 6166}));
+  assert(trace.lengths == std::vector<uint64_t>({184, 70, 70}));
   assert(precedenteSequenzaMs == 5700 && ultimoPeriodoMs == 700 && frontiPeriodo == 1);
-  assert(tempoRichiestoMs == 280 && stato == MANTENIMENTO);
-  assert(Serial.output == "2/3\n"
-                          "Imp:150 Corr:-20 Dt:       700 Fr:         1 Req:280 N:  1/  2\n"
-                          "2/2\n");
+  assert(tempoRichiestoMs == 290 && stato == MANTENIMENTO);
+  assert(Serial.output == "2/3 t:       666 d:       666\n"
+                          "Imp:150 Corr: -10 Dt:       700 Fr:    1 Req:290 1/3 t:0\n"
+                          "2/3 t:       233 d:       233\n"
+                          "3/3 t:       466 d:       233\n");
 }
 
 static void encoder_has_priority_at_maintenance_start_and_end() {
   example_sequence(); tick(5150); Serial.output.clear();
   edge(5666); // Istante programmato del secondo impulso della vecchia sequenza.
   assert(stato == MOTOR_ON && precedenteSequenzaMs == 5666);
-  assert(Serial.output == "Imp:150 Corr:-20 Dt:       666 Fr:         1 Req:280 N:  1/  2\n");
+  assert(Serial.output == "Imp:150 Corr:  -7 Dt:       666 Fr:    1 Req:293 1/3 t:0\n");
   tick(5815); assert(hardware::levels[3] == HIGH);
   tick(5816); assert(hardware::levels[3] == LOW);
 
@@ -225,7 +226,7 @@ static void no_timeout_after_block_or_final_maintenance() {
   edge(3152, false);
   assert(hardware::levels[3] == HIGH && bloccaggioRichiesto);
   tick(3152);
-  assert(stato == MOTOR_ON && ultimoPeriodoMs == 152 && tempoRichiestoMs == 220);
+  assert(stato == MOTOR_ON && ultimoPeriodoMs == 152 && tempoRichiestoMs == 245);
 
   example_sequence(); observe(5000, 6403);
   assert(stato == MANTENIMENTO && hardware::levels[3] == LOW && encoderPronto);
@@ -236,23 +237,63 @@ static void no_timeout_after_block_or_final_maintenance() {
 }
 
 static void correction_uses_same_sequence_time_and_counter_window() {
-  first_sequence(); tempoRichiestoMs = 280; edge(3500); // T=500, n=1: richiesta 300.
+  first_sequence(); tempoRichiestoMs = 290; edge(3500); // T=500, n=1: +10, richiesta 300.
   const Trace trace = observe(3500, 4203);
   assert(trace.starts == std::vector<uint64_t>({3500, 3666, 3833}));
   assert(trace.lengths == std::vector<uint64_t>({150, 70, 70}));
   assert(precedenteSequenzaMs == 3500 && tempoRichiestoMs == 300);
-  edge(4204); // T=704, n=1: richiesta 280.
-  assert(ultimoPeriodoMs == 704 && frontiPeriodo == 1 && tempoRichiestoMs == 280);
+  edge(4204); // T=704, n=1: -10, richiesta 290.
+  assert(ultimoPeriodoMs == 704 && frontiPeriodo == 1 && tempoRichiestoMs == 290);
 
   first_sequence(); edge(3600); // T=600, n=1: invariata, solo bloccaggio.
   assert(ultimoPeriodoMs == 600 && tempoRichiestoMs == 200 && numeroImpulsi == 1);
-  first_sequence(); edge(3601); // T=601, n=1: -20, solo bloccaggio.
-  assert(ultimoPeriodoMs == 601 && tempoRichiestoMs == 180 && numeroImpulsi == 1);
+  first_sequence(); edge(3601); // T=601, n=1: -0,1 ms arrotonda a zero.
+  assert(ultimoPeriodoMs == 601 && tempoRichiestoMs == 200 && numeroImpulsi == 1);
+}
+
+static void proportional_correction_matches_measured_samples() {
+  const uint32_t periods[] = {3340, 2867, 3738, 2865, 4285, 4553, 5059};
+  const uint32_t edges[] = {8, 14, 4, 47, 30, 29, 5};
+  const int corrections[] = {18, 40, -33, 54, 46, 44, -41};
+  for (size_t i = 0; i < 7; ++i) {
+    first_sequence(); tempoRichiestoMs = 300;
+    encoderTotale = totaleAllaSequenza + edges[i] - 1;
+    edge(3000 + periods[i]);
+    assert(ultimoPeriodoMs == periods[i] && frontiPeriodo == edges[i]);
+    assert(tempoRichiestoMs == 300 + corrections[i]);
+  }
+}
+
+static void proportional_gain_uses_average_and_rounds_symmetrically() {
+  assert(KP_PER_MILLE == 100);
+  assert(correzioneProporzionaleMs(500, 1) == 10);
+  assert(correzioneProporzionaleMs(1000, 2) == 10); // Stessa media: stessa correzione.
+  assert(correzioneProporzionaleMs(300, 1) == 30);
+  assert(correzioneProporzionaleMs(700, 1) == -10);
+  assert(correzioneProporzionaleMs(900, 1) == -30);
+  assert(correzioneProporzionaleMs(599, 1) == 0);
+  assert(correzioneProporzionaleMs(601, 1) == 0);
+  assert(correzioneProporzionaleMs(595, 1) == 1);
+  assert(correzioneProporzionaleMs(605, 1) == -1);
+  assert(correzioneProporzionaleMs(1190, 2) == 1);
+  assert(correzioneProporzionaleMs(1210, 2) == -1);
+  assert(correzioneProporzionaleMs(1200, 2) == 0);
+  assert(correzioneProporzionaleMs(1000, 0) == 0);
+}
+
+static void proportional_limits_and_large_counters() {
+  assert(correzioneProporzionaleMs(UINT32_MAX, UINT32_MAX) == 60);
+  assert(correzioneProporzionaleMs(UINT32_MAX, 1) == -429496670LL);
+  assert(limitaRichiestaMs(500) == 400 && limitaRichiestaMs(0) == 50);
+  first_sequence(); tempoRichiestoMs = 400; Serial.output.clear(); edge(3500);
+  assert(tempoRichiestoMs == 400 && Serial.output.find("Corr:  +0") != std::string::npos);
+  first_sequence(); tempoRichiestoMs = 400; edge(3000ULL + UINT32_MAX);
+  assert(tempoRichiestoMs == 50 && ultimoPeriodoMs == UINT32_MAX && frontiPeriodo == 1);
 }
 
 static void fractional_spacing_does_not_accumulate_rounding() {
-  first_sequence(); tempoRichiestoMs = 400; edge(5003);
-  assert(tempoRichiestoMs == 380 && numeroImpulsi == 4);
+  first_sequence(3); tempoRichiestoMs = 390; edge(5003);
+  assert(tempoRichiestoMs == 400 && numeroImpulsi == 4);
   const Trace trace = observe(5003, 6875);
   assert(trace.starts == std::vector<uint64_t>({5003, 5503, 6004, 6505}));
   assert(trace.lengths == std::vector<uint64_t>({150, 70, 70, 70}));
@@ -269,8 +310,8 @@ static void delayed_loop_measures_actual_sequence_start() {
   tick(3149); assert(hardware::levels[3] == HIGH);
   tick(3150); assert(hardware::levels[3] == LOW && stato == MANTENIMENTO);
   Serial.output.clear(); edge(3601, false); tick(3602);
-  assert(ultimoPeriodoMs == 601 && frontiPeriodo == 3 && tempoRichiestoMs == 220);
-  assert(Serial.output == "Imp:150 Corr:+20 Dt:       601 Fr:         3 Req:220 N:  1/  1\n");
+  assert(ultimoPeriodoMs == 601 && frontiPeriodo == 3 && tempoRichiestoMs == 240);
+  assert(Serial.output == "Imp:150 Corr: +40 Dt:       601 Fr:    3 Req:240 1/2 t:0\n");
   tick(3750); assert(hardware::levels[3] == HIGH);
   tick(3751); assert(hardware::levels[3] == LOW);
 }
@@ -294,19 +335,23 @@ static void late_loop_does_not_merge_or_shorten_pulses() {
   assert(trace.lengths == std::vector<uint64_t>({70, 70}));
   assert(precedenteSequenzaMs == 5000 && ultimoPeriodoMs == 2000);
   assert(stato == MANTENIMENTO);
+  assert(Serial.output.find("2/3 t:      2001 d:      2001\n") != std::string::npos);
+  assert(Serial.output.find("3/3 t:      2072 d:        71\n") != std::string::npos);
 }
 
 static void maximum_requested_time_keeps_physical_pulses_fixed() {
   reset(); ready();
-  const uint16_t requests[] = {200, 220, 240, 260, 280, 300, 320, 340,
-                                360, 380, 400, 400, 400, 400, 400};
-  const size_t counts[] = {1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4};
-  for (uint64_t cycle = 0; cycle < 15; ++cycle) {
+  const uint16_t requests[] = {200, 210, 220, 230, 240, 250, 260, 270, 280,
+                              290, 300, 310, 320, 330, 340, 350, 360, 370,
+                              380, 390, 400, 400, 400, 400, 400};
+  const size_t counts[] = {1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3,
+                           3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4};
+  for (uint64_t cycle = 0; cycle < 25; ++cycle) {
     const uint64_t start = 3000 + cycle * 2000;
     Serial.output.clear(); edge(start);
     assert(tempoRichiestoMs == requests[cycle]);
-    if (cycle >= 11)
-      assert(Serial.output == "Imp:150 Corr: +0 Dt:      2000 Fr:         4 Req:400 N:  1/  4\n");
+    if (cycle >= 21)
+      assert(Serial.output == "Imp:150 Corr:  +0 Dt:      2000 Fr:    4 Req:400 1/4 t:0\n");
     const Trace trace = observe(start, start + 1999, {start + 20, start + 40, start + 60});
     std::vector<uint64_t> lengths(counts[cycle], 70); lengths.front() = 150;
     assert(trace.starts.size() == counts[cycle] && trace.lengths == lengths);
@@ -316,16 +361,16 @@ static void maximum_requested_time_keeps_physical_pulses_fixed() {
 
 static void minimum_request_still_generates_blocking_pulse() {
   reset(); ready();
-  const uint16_t requests[] = {200, 180, 160, 140, 120, 100, 80, 60,
-                                50, 50, 50, 50, 50, 50, 50};
+  const uint16_t requests[] = {200, 160, 120, 80, 50, 50, 50, 50,
+                              50, 50, 50, 50, 50, 50, 50};
   for (uint64_t cycle = 0; cycle < 15; ++cycle) {
     const uint64_t start = 3000 + cycle * 1000;
     Serial.output.clear(); edge(start);
     assert(tempoRichiestoMs == requests[cycle]);
-    if (cycle == 8)
-      assert(Serial.output == "Imp:150 Corr:-10 Dt:      1000 Fr:         1 Req: 50 N:  1/  1\n");
-    if (cycle >= 9)
-      assert(Serial.output == "Imp:150 Corr: +0 Dt:      1000 Fr:         1 Req: 50 N:  1/  1\n");
+    if (cycle == 4)
+      assert(Serial.output == "Imp:150 Corr: -30 Dt:      1000 Fr:    1 Req: 50 1/1 t:0\n");
+    if (cycle >= 5)
+      assert(Serial.output == "Imp:150 Corr:  +0 Dt:      1000 Fr:    1 Req: 50 1/1 t:0\n");
     const Trace trace = observe(start, start + 999);
     assert(trace.starts == std::vector<uint64_t>({start}));
     assert(trace.lengths == std::vector<uint64_t>({150}));
@@ -371,20 +416,24 @@ static void stop_cancels_pending_isr_request_before_recalculation() {
 static void millis_rollover_during_distributed_sequence() {
   const uint64_t wrap = UINT32_MAX;
   reset(wrap - 8000); ready(wrap - 8000);
-  edge(wrap - 2500); tick(wrap - 2350); tick(wrap - 2050);
-  tempoRichiestoMs = 400; edge(wrap - 500);
-  assert(ultimoPeriodoMs == 2000 && tempoRichiestoMs == 380);
+  edge(wrap - 2500); edge(wrap - 2480); edge(wrap - 2460); edge(wrap - 2440);
+  tick(wrap - 2350); tick(wrap - 2050); Serial.output.clear();
+  tempoRichiestoMs = 390; edge(wrap - 500);
+  assert(ultimoPeriodoMs == 2000 && tempoRichiestoMs == 400);
   const Trace trace = observe(wrap - 500, wrap + 1370);
   assert(trace.starts == std::vector<uint64_t>({wrap - 500, wrap, wrap + 500, wrap + 1000}));
   assert(trace.lengths == std::vector<uint64_t>({150, 70, 70, 70}));
   assert(stato == MANTENIMENTO);
+  assert(Serial.output.find("2/4 t:       500 d:       500\n") != std::string::npos);
+  assert(Serial.output.find("3/4 t:      1000 d:       500\n") != std::string::npos);
+  assert(Serial.output.find("4/4 t:      1500 d:       500\n") != std::string::npos);
 }
 
 static void encoder_counter_rollover() {
   reset(); ready(); encoderTotale = UINT32_MAX - 2;
   tempoRichiestoMs = 280;
   edge(3000); edge(3010); edge(3020); tick(3150); tick(3450); edge(4000);
-  assert(frontiPeriodo == 3 && ultimoPeriodoMs == 1000 && tempoRichiestoMs == 300);
+  assert(frontiPeriodo == 3 && ultimoPeriodoMs == 1000 && tempoRichiestoMs == 307);
   const Trace trace = observe(4000, 5036);
   assert(trace.starts == std::vector<uint64_t>({4000, 4333, 4666}));
   assert(trace.lengths == std::vector<uint64_t>({150, 70, 70}));
@@ -393,9 +442,10 @@ static void encoder_counter_rollover() {
 static void long_period_offsets_use_64bit_products() {
   first_sequence(); tempoRichiestoMs = 400;
   const uint64_t start = 3000003000ULL;
+  encoderTotale += 4999999; // Dt=3e9, n=5e6: media 600 ms, correzione nulla.
   Serial.output.clear(); edge(start);
-  assert(ultimoPeriodoMs == 3000000000UL && tempoRichiestoMs == 380 && numeroImpulsi == 4);
-  assert(Serial.output.size() == 63 && Serial.output.find("Dt:3000000000") != std::string::npos);
+  assert(ultimoPeriodoMs == 3000000000UL && tempoRichiestoMs == 400 && numeroImpulsi == 4);
+  assert(Serial.output.size() <= 63 && Serial.output.find("Dt:3000000000") != std::string::npos);
   tick(start + 149); assert(hardware::levels[3] == HIGH);
   tick(start + 150); assert(hardware::levels[3] == LOW);
   for (const uint64_t offset : {750000000ULL, 1500000000ULL, 2250000000ULL}) {
@@ -408,7 +458,7 @@ static void long_period_offsets_use_64bit_products() {
 }
 
 static void congested_serial_does_not_delay_the_sequence() {
-  first_sequence(); tempoRichiestoMs = 320;
+  first_sequence(1); tempoRichiestoMs = 340;
   Serial.output.clear(); Serial.txBlocked = true; edge(5000);
   const Trace trace = observe(5000, 6703, {}, true);
   assert(trace.starts == std::vector<uint64_t>({5000, 5666, 6333}));
@@ -421,8 +471,8 @@ static void serial_logs_boot_and_every_physical_pulse_once() {
   tick(999); tick(1000); tick(1001); ready();
   assert(Serial.output == "Avvio freno\n");
   Serial.output.clear(); edge(3000); tick(3001); edge(3100); tick(3150); tick(3450);
-  assert(Serial.output == "Imp:150 Corr: +0 Dt:         0 Fr:         0 Req:200 N:  1/  1\n");
-  tempoRichiestoMs = 320;
+  assert(Serial.output == "Imp:150 Corr:  +0 Dt:         0 Fr:    0 Req:200 1/1 t:0\n");
+  tempoRichiestoMs = 305;
   edge(4301); tick(4451); tick(4734);
   assert(tempoRichiestoMs == 300 && ultimoPeriodoMs == 1301 && frontiPeriodo == 2);
   assert(precedenteSequenzaMs == 4301 && totaleAllaSequenza == 3);
@@ -433,17 +483,17 @@ static void serial_logs_boot_and_every_physical_pulse_once() {
   Serial.receive("s"); tick(5300);
   Serial.receive("a"); tick(5301);
   tick(6801); tick(7101); edge(7200);
-  assert(Serial.output == "Imp:150 Corr: +0 Dt:         0 Fr:         0 Req:200 N:  1/  1\n"
-                          "Imp:150 Corr:-20 Dt:      1301 Fr:         2 Req:300 N:  1/  3\n"
-                          "2/3\n"
-                          "3/3\n"
-                          "Imp:150 Corr: +0 Dt:         0 Fr:         0 Req:200 N:  1/  1\n");
+  assert(Serial.output == "Imp:150 Corr:  +0 Dt:         0 Fr:    0 Req:200 1/1 t:0\n"
+                          "Imp:150 Corr:  -5 Dt:      1301 Fr:    2 Req:300 1/3 t:0\n"
+                          "2/3 t:       433 d:       433\n"
+                          "3/3 t:       867 d:       434\n"
+                          "Imp:150 Corr:  +0 Dt:         0 Fr:    0 Req:200 1/1 t:0\n");
 }
 
 static void serial_logs_need_space_for_the_whole_line() {
   reset(); ready(); Serial.output.clear();
-  const std::string expected = "Imp:150 Corr: +0 Dt:         0 Fr:         0 Req:200 N:  1/  1\n";
-  assert(expected.size() == 63);
+  const std::string expected = "Imp:150 Corr:  +0 Dt:         0 Fr:    0 Req:200 1/1 t:0\n";
+  assert(expected.size() <= 63);
   Serial.txSpace = int(expected.size()) - 1; edge(3000);
   assert(Serial.output.empty() && hardware::levels[3] == HIGH);
   tick(3150); assert(Serial.output.empty() && hardware::levels[3] == LOW);
@@ -452,12 +502,29 @@ static void serial_logs_need_space_for_the_whole_line() {
   assert(Serial.output == expected);
 
   example_sequence(); Serial.output.clear(); tick(5150);
-  Serial.txSpace = 3; tick(5666); // "2/3\n" non entra interamente.
+  const std::string second = "2/3 t:       666 d:       666\n";
+  const std::string third = "3/3 t:      1333 d:       667\n";
+  Serial.txSpace = int(second.size()) - 1; tick(5666); // La riga non entra interamente.
   assert(Serial.output.empty() && hardware::levels[3] == HIGH);
   tick(5736); assert(hardware::levels[3] == LOW);
-  Serial.txSpace = 4; tick(6333); // La riga breve entra anche senza spazio per 63 byte.
-  assert(Serial.output == "3/3\n" && hardware::levels[3] == HIGH);
+  Serial.txSpace = int(third.size()); tick(6333); // d resta fisico anche se il secondo log e' saltato.
+  assert(Serial.output == third && hardware::levels[3] == HIGH);
   tick(6403); assert(hardware::levels[3] == LOW);
+}
+
+static void serial_timestamps_and_large_counters_fit_uart_buffer() {
+  first_sequence(); tempoRichiestoMs = 340;
+  encoderTotale = totaleAllaSequenza - 2; // Il prossimo fronte produce una differenza UINT32_MAX.
+  const uint64_t start = 3000ULL + UINT32_MAX;
+  Serial.output.clear(); Serial.txSpace = 63; edge(start);
+  assert(Serial.output == "Imp:150 Corr: +60 Dt:4294967295 Fr:4294967295 Req:400 1/4 t:0\n");
+  assert(Serial.output.size() == 62 && numeroImpulsi == 4);
+  tick(start + 150); Serial.output.clear();
+  tick(start + 1073741823ULL);
+  assert(Serial.output == "2/4 t:1073741823 d:1073741823\n");
+  tick(start + 1073741893ULL); Serial.output.clear();
+  tick(start + 2147483647ULL);
+  assert(Serial.output == "3/4 t:2147483647 d:1073741824\n");
 }
 
 static void maintenance_threshold_is_strict_and_blocking_is_subtracted() {
@@ -481,7 +548,7 @@ static void maintenance_threshold_is_strict_and_blocking_is_subtracted() {
 }
 
 static void short_period_leaves_room_for_long_blocking_pulse() {
-  first_sequence(); tempoRichiestoMs = 380; edge(3500);
+  first_sequence(); tempoRichiestoMs = 390; edge(3500);
   assert(tempoRichiestoMs == 400 && ultimoPeriodoMs == 500);
   const Trace trace = observe(3500, 4203);
   // Quattro avvii ogni 125 ms sovrapporrebbero il bloccaggio da 150 ms.
@@ -502,6 +569,9 @@ int main() {
   encoder_has_priority_at_maintenance_start_and_end();
   no_timeout_after_block_or_final_maintenance();
   correction_uses_same_sequence_time_and_counter_window();
+  proportional_correction_matches_measured_samples();
+  proportional_gain_uses_average_and_rounds_symmetrically();
+  proportional_limits_and_large_counters();
   fractional_spacing_does_not_accumulate_rounding();
   delayed_loop_measures_actual_sequence_start();
   encoder_arriving_after_loop_clock_does_not_expire_new_block();
@@ -516,7 +586,8 @@ int main() {
   congested_serial_does_not_delay_the_sequence();
   serial_logs_boot_and_every_physical_pulse_once();
   serial_logs_need_space_for_the_whole_line();
+  serial_timestamps_and_large_counters_fit_uart_buffer();
   maintenance_threshold_is_strict_and_blocking_is_subtracted();
   short_period_leaves_room_for_long_blocking_pulse();
-  std::cout << "27 gruppi di test PASS (simulazione, non validazione del prototipo)\n";
+  std::cout << "31 gruppi di test PASS (simulazione, non validazione del prototipo)\n";
 }
