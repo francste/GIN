@@ -7,6 +7,8 @@ Ogni stato contiene una parte **ONCE**, eseguita all'ingresso, e una parte
 freno. Le successive durano `IMPULSO_MANTENIMENTO_MS`, inizialmente **70 ms**,
 per mantenere il blocco. La correzione modifica il tempo totale richiesto,
 dal quale si sottrae il bloccaggio prima di calcolare il mantenimento.
+Ogni sequenza programma almeno **150 + 70 = 220 ms** di accensione,
+compresa la prima: un bloccaggio e almeno un mantenimento.
 
 ## Sequenza
 
@@ -45,43 +47,49 @@ ricalcola una sola volta la richiesta e passa a `MOTOR_ON`.
 Se il motore e' gia' acceso per un mantenimento, rimane HIGH senza un
 passaggio LOW: il nuovo bloccaggio dura 150 ms dal fronte rilevato.
 
-La prima sequenza emette il solo impulso di bloccaggio da 150 ms: manca
-ancora un periodo `Dt` misurato. Il regolatore registra la base del confronto e
-mantiene la richiesta iniziale di 200 ms. Anche il primo avvio dopo il
-comando `a` segue questa regola.
+La prima sequenza mantiene la richiesta iniziale di 220 ms e registra la
+base del confronto, senza correzione. Manca ancora un periodo `Dt` misurato:
+si usa `MS_PER_FRONTE = 600 ms` per distribuire le due accensioni, da 150 ms
+a `t=0` e da 70 ms a `t=300`. Anche il primo avvio dopo il comando `a`
+segue questa regola.
 
 ## Distribuzione delle accensioni
 
-Dal secondo avvio si usa il periodo misurato tra gli inizi di due sequenze.
-Il bloccaggio e' sempre presente e viene sottratto dalla richiesta totale.
-Si aggiunge mantenimento solo se la richiesta e' **strettamente maggiore**
-del bloccaggio piu' un impulso di mantenimento:
+La richiesta viene limitata fra 220 e 400 ms. Il minimo e' calcolato come
+`IMPULSO_BLOCCAGGIO_MS + IMPULSO_MANTENIMENTO_MS`: il bloccaggio da 150 ms
+viene sottratto e il residuo contiene sempre almeno un mantenimento da 70 ms.
+Si distribuiscono gli avvii sul periodo misurato, oppure su 600 ms quando
+non c'e' ancora un `Dt`. Un periodo troppo breve viene allargato per lasciare
+l'impulso piu' lungo e almeno 1 ms spento fra gli avvii:
 
 ```text
 Dt = inizio sequenza attuale - inizio sequenza precedente
-N = 1  [solo bloccaggio]
-se Dt > 0 e richiesta > IMPULSO_BLOCCAGGIO_MS + IMPULSO_MANTENIMENTO_MS:
-    residuo = richiesta - IMPULSO_BLOCCAGGIO_MS
-    N += residuo / IMPULSO_MANTENIMENTO_MS       [divisione intera]
-avvio dell'accensione k = inizio sequenza + floor(k * Dt / N)
+residuo = richiesta - IMPULSO_BLOCCAGGIO_MS
+N = 1 + residuo / IMPULSO_MANTENIMENTO_MS        [divisione intera; N >= 2]
+periodo = Dt se Dt > 0, altrimenti MS_PER_FRONTE
+periodo minimo = N * (max(bloccaggio, mantenimento) + 1 ms)
+periodo distribuzione = max(periodo, periodo minimo)
+avvio dell'accensione k = inizio sequenza + floor(k * periodo distribuzione / N)
 k = 0, 1, ..., N-1
 ```
 
-Con i parametri iniziali, la soglia e' **220 ms**: a 220 ms si genera il solo
-bloccaggio; a 221 ms si aggiunge un mantenimento da 70 ms.
+Con i parametri iniziali, a **220 ms** si generano sempre un bloccaggio e un
+mantenimento. Anche una richiesta di 200 ms viene portata a 220 ms.
+Fra 220 e 289 ms si programmano due accensioni; a 290 ms diventano tre.
 Con `Dt = 2000 ms` e richiesta di 300 ms, il residuo e' 150 ms: si generano
 **3 accensioni**, agli istanti relativi **0, 666 e 1333 ms**, rispettivamente
 **150, 70 e 70 ms**. Il tempo totale acceso e' **290 ms**: la divisione
 arrotonda per difetto e il resto non viene recuperato.
 
-Il bloccaggio da 150 ms viene comunque emesso anche se la richiesta e'
-inferiore alla sua durata. Il regolatore conserva i limiti della richiesta
-di 50 e 400 ms; la durata fisica minima della sequenza e' il bloccaggio.
+Le durate fisiche restano fisse, 150 e 70 ms. Il resto inferiore a 70 ms
+non genera un altro mantenimento. La durata minima programmata e' 220 ms;
+il controllo non scende al solo bloccaggio quando applica una correzione negativa.
 
 Gli istanti vengono calcolati rispetto all'inizio della sequenza. Quando
-`Dt` non e' divisibile per `N`, le distanze differiscono al massimo di 1 ms:
+il periodo di distribuzione non e' divisibile per `N`, le distanze
+differiscono al massimo di 1 ms:
 con `Dt = 2000 ms` e `N = 3`, gli avvii sono a 0, 666 e 1333 ms.
-Il prodotto `k * Dt` usa 64 bit per evitare overflow.
+Il prodotto `k * periodo distribuzione` usa 64 bit per evitare overflow.
 
 I fronti durante i 150 ms di `MOTOR_ON` vengono contati per la correzione
 successiva, senza riavviare o allungare il bloccaggio. In `MANTENIMENTO`,
@@ -89,14 +97,18 @@ invece, il primo fronte valido interrompe la sequenza in corso, sia durante
 un'accensione da 70 ms sia in una pausa. I mantenimenti residui vengono
 cancellati e sostituiti dalla nuova sequenza corretta.
 Dopo l'ultimo mantenimento la pompa si spegne e rimane in `MANTENIMENTO`
-in attesa di un fronte, senza timeout. Anche quando non sono previsti
-mantenimenti, l'encoder viene riabilitato subito alla fine del bloccaggio.
+in attesa di un fronte, senza timeout. L'encoder viene riabilitato subito
+alla fine del bloccaggio. Sono sempre previsti mantenimenti, ma un nuovo
+fronte o il comando di stop possono interromperli prima che siano completati.
 `ATTENDI_ARRESTO` e' soltanto l'attesa iniziale temporizzata e non verifica
 che l'encoder sia fermo.
 
-Il numero di accensioni viene eventualmente ridotto perche' ogni distanza
-fra avvii contenga l'impulso piu' lungo (150 ms con questi parametri) e
-almeno 1 ms spento. Il bloccaggio parte nell'ISR e i suoi 150 ms decorrono
+Con `Dt = 200 ms` e richiesta di 340 ms si conservano tre accensioni:
+il periodo di distribuzione diventa 453 ms, con avvii a 0, 151 e 302 ms.
+Il numero di mantenimenti non viene ridotto a causa del periodo breve.
+`Dt` nel log resta il periodo effettivamente misurato, 200 ms in questo caso;
+`t` e `d` mostrano gli avvii effettivi della distribuzione allargata.
+Il bloccaggio parte nell'ISR e i suoi 150 ms decorrono
 da quell'istante, anche se il loop gestisce la richiesta in ritardo.
 Ogni mantenimento parte quando il loop osserva la scadenza e dura 70 ms
 dall'accensione effettiva. Se il loop e' in ritardo, i mantenimenti possono
@@ -145,7 +157,7 @@ Esempi dai campioni misurati, prima dei limiti della richiesta:
 | 2865 | 47 | 61,0 | +54 |
 | 5059 | 5 | 1011,8 | -41 |
 
-La richiesta resta tra **50 e 400 ms**, con valore iniziale **200 ms**.
+La richiesta resta tra **220 e 400 ms**, con valore iniziale **220 ms**.
 Anche il valore iniziale viene limitato: impostare 500 ms con massimo
 400 ms avvia direttamente a 400 ms. Nel log `Corr` indica la variazione
 effettiva dopo i limiti: a 400 ms un incremento richiesto mostra `Corr:+0`,
@@ -174,9 +186,9 @@ I parametri sono all'inizio del `.ino`:
 | `MS_PER_FRONTE` | 600 | Tempo obiettivo per ciascun fronte |
 | `IMPULSO_BLOCCAGGIO_MS` | 150 | Prima accensione di ogni sequenza |
 | `IMPULSO_MANTENIMENTO_MS` | 70 | Accensioni successive distribuite su Dt |
-| `RICHIESTA_INIZIALE_MS` | 200 | Tempo totale richiesto iniziale |
+| `RICHIESTA_INIZIALE_MS` | 220 | Tempo totale richiesto iniziale, pari al minimo |
 | `KP_PER_MILLE` | 100 | Guadagno proporzionale: 100 corrisponde a Kp = 0,10 |
-| `RICHIESTA_MINIMA_MS` | 50 | Richiesta minima |
+| `RICHIESTA_MINIMA_MS` | 220 | Bloccaggio + un mantenimento, calcolato dalle due durate |
 | `RICHIESTA_MASSIMA_MS` | 400 | Richiesta massima |
 
 ```text
@@ -245,7 +257,7 @@ Monitor seriale a **115200 baud**, con o senza terminazione di riga:
 | Comando | Effetto |
 | --- | --- |
 | `s` | Passa a `FERMO` e spegne la pompa nello stesso loop |
-| `a` | Da `FERMO`, riparte con pregonfiaggio e richiesta iniziale di 200 ms |
+| `a` | Da `FERMO`, riparte con pregonfiaggio e richiesta iniziale di 220 ms |
 
 `a` durante una prova attiva viene ignorato. Una nuova prova cancella i
 campioni della precedente. I timer degli stati usano `millis()` e il filtro
@@ -290,9 +302,10 @@ restano invariati durante il mantenimento, senza essere ristampati.
 Il conteggio in corso continua
 nell'ISR e sara' campionato all'inizio della sequenza successiva.
 
-La prima sequenza stampa `Imp:150`, `Dt:0`, `Fr:0`, `Corr:+0`, `Req:200` e
-`1/1 t:0`, con spazi per allineare i campi. Anche dopo `a` riparte cosi', senza ripetere
-la stringa di avvio. Il pregonfiaggio da 1500 ms non genera righe impulso.
+La prima sequenza stampa `Imp:150`, `Dt:0`, `Fr:0`, `Corr:+0`, `Req:220` e
+`1/2 t:0`, poi `2/2 t:300 d:300`, con spazi per allineare i campi.
+Anche dopo `a` riparte cosi', senza ripetere la stringa di avvio.
+Il pregonfiaggio da 1500 ms non genera righe impulso.
 Non ci sono messaggi periodici o di cambio stato.
 
 Ogni riga viene inviata solo se entra interamente nel buffer UART; con
@@ -330,7 +343,7 @@ AVR GCC Debian 14.2.0, diverso da quello del pacchetto Arduino standard.
 Gli indici remoti e i tool di discovery non disponibili non impediscono
 la compilazione con il core locale. Il caricamento USB non e' verificato.
 
-I test verificano 31 gruppi: GPIO e prima sequenza, debug/holdoff,
+I test verificano 32 gruppi: GPIO e prima sequenza, debug/holdoff,
 rollover di `micros()`, ONCE, pregonfiaggio da 1500 ms e attesa iniziale fissa,
 bloccaggio da 150 ms e due mantenimenti da 70 ms con richiesta di 300 ms su
 2000 ms, interruzione del mantenimento in pausa e durante l'accensione,
@@ -344,8 +357,9 @@ e pausa, stop con richiesta ISR pendente, rollover di `millis()` e del contatore
 a 64 bit, seriale congestionata, log di ogni accensione e spazio UART,
 timestamp e distanze effettive anche con righe saltate e loop in ritardo,
 righe con contatori e timestamp a 10 cifre entro il buffer da 63 byte,
-soglia stretta di mantenimento a 220 ms, distanza sufficiente per il
-bloccaggio con periodi brevi.
+minimo di 220 ms con mantenimento presente, prima sequenza senza Dt anche
+con richiesta maggiore, distribuzione allargata con periodi brevi senza
+eliminare mantenimenti.
 
 ```sh
 set -e

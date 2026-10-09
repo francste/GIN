@@ -12,13 +12,14 @@ constexpr uint32_t TIMEOUT_ARRESTO_MS = 300;
 constexpr uint32_t MS_PER_FRONTE = 600;
 constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 150; // Prima accensione di ogni sequenza.
 constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 70;
-constexpr uint16_t RICHIESTA_INIZIALE_MS = 200;
+constexpr uint16_t RICHIESTA_MINIMA_MS = IMPULSO_BLOCCAGGIO_MS + IMPULSO_MANTENIMENTO_MS;
+constexpr uint16_t RICHIESTA_INIZIALE_MS = RICHIESTA_MINIMA_MS; // 220 ms: blocco + mantenimento.
 constexpr uint16_t KP_PER_MILLE = 100;         // Kp = 0,10 ms di correzione per ms di errore medio.
-constexpr uint16_t RICHIESTA_MINIMA_MS = 50;
 constexpr uint16_t RICHIESTA_MASSIMA_MS = 400;
 static_assert(IMPULSO_BLOCCAGGIO_MS > 0 && IMPULSO_BLOCCAGGIO_MS <= RICHIESTA_MASSIMA_MS &&
-              IMPULSO_MANTENIMENTO_MS > 0 && IMPULSO_MANTENIMENTO_MS <= RICHIESTA_MASSIMA_MS,
-              "Le durate degli impulsi devono essere tra 1 e RICHIESTA_MASSIMA_MS");
+              IMPULSO_MANTENIMENTO_MS > 0 &&
+              uint32_t(IMPULSO_BLOCCAGGIO_MS) + IMPULSO_MANTENIMENTO_MS <= RICHIESTA_MASSIMA_MS,
+              "La richiesta massima deve contenere bloccaggio e almeno un mantenimento");
 
 enum Stato { PRE_GONFIAGGIO, ATTENDI_ARRESTO, ATTENDI_FRONTE,
              MOTOR_ON, MANTENIMENTO, FERMO };
@@ -27,7 +28,8 @@ bool ingressoStato = true;                     // true soltanto dopo una transiz
 uint32_t inizioStatoMs = 0;
 uint16_t tempoRichiestoMs = RICHIESTA_INIZIALE_MS;
 uint32_t inizioSequenzaMs = 0;
-uint16_t numeroImpulsi = 1;
+uint32_t periodoDistribuzioneMs = MS_PER_FRONTE;
+uint16_t numeroImpulsi = 2;
 uint16_t indiceImpulso = 0;                    // 0 = prima accensione della sequenza.
 bool mantenimentoAcceso = false;
 uint32_t ultimoImpulsoMs = 0;                  // Accensione precedente, anche se il log e' saltato.
@@ -145,20 +147,14 @@ void preparaSequenza(uint32_t now, uint32_t totale) {
   totaleAllaSequenza = totale;
   precedenteSequenzaValida = true;
 
-  // Il bloccaggio e' sempre presente. Il mantenimento usa solo il residuo.
-  numeroImpulsi = 1;
-  if (ultimoPeriodoMs > 0 &&
-      tempoRichiestoMs > uint32_t(IMPULSO_BLOCCAGGIO_MS) + IMPULSO_MANTENIMENTO_MS) {
-    numeroImpulsi += (tempoRichiestoMs - IMPULSO_BLOCCAGGIO_MS) / IMPULSO_MANTENIMENTO_MS;
-  }
-  // Prima sequenza: manca Dt, quindi resta il solo impulso di bloccaggio.
-  if (numeroImpulsi > 1) {
-    // La distanza fra avvii deve contenere anche l'impulso piu' lungo e 1 ms spento.
-    const uint16_t impulsoPiuLungoMs = IMPULSO_BLOCCAGGIO_MS > IMPULSO_MANTENIMENTO_MS
-                                       ? IMPULSO_BLOCCAGGIO_MS : IMPULSO_MANTENIMENTO_MS;
-    const uint32_t capienza = ultimoPeriodoMs / (uint32_t(impulsoPiuLungoMs) + 1);
-    if (numeroImpulsi > capienza) numeroImpulsi = capienza > 0 ? uint16_t(capienza) : 1;
-  }
+  // Il minimo di 220 ms garantisce blocco da 150 ms + almeno un mantenimento da 70 ms.
+  numeroImpulsi = 1 + (tempoRichiestoMs - IMPULSO_BLOCCAGGIO_MS) / IMPULSO_MANTENIMENTO_MS;
+  // Senza Dt usa 600 ms; con Dt corto allarga la distribuzione senza eliminare impulsi.
+  periodoDistribuzioneMs = ultimoPeriodoMs > 0 ? ultimoPeriodoMs : MS_PER_FRONTE;
+  const uint16_t impulsoPiuLungoMs = IMPULSO_BLOCCAGGIO_MS > IMPULSO_MANTENIMENTO_MS
+                                     ? IMPULSO_BLOCCAGGIO_MS : IMPULSO_MANTENIMENTO_MS;
+  const uint32_t periodoMinimoMs = uint32_t(numeroImpulsi) * (uint32_t(impulsoPiuLungoMs) + 1);
+  if (periodoDistribuzioneMs < periodoMinimoMs) periodoDistribuzioneMs = periodoMinimoMs;
 }
 
 void aggiornaFreno(uint32_t now) {
@@ -191,7 +187,8 @@ void aggiornaFreno(uint32_t now) {
           precedenteSequenzaValida = false;
           ultimoPeriodoMs = frontiPeriodo = 0;
           indiceImpulso = 0;
-          numeroImpulsi = 1;
+          numeroImpulsi = 2;
+          periodoDistribuzioneMs = MS_PER_FRONTE;
           mantenimentoAcceso = false;
           ultimoImpulsoMs = 0;
           inizioSequenzaMs = 0;
@@ -258,7 +255,7 @@ void aggiornaFreno(uint32_t now) {
           }
         } else if (indiceImpulso < numeroImpulsi &&
                    uint32_t(now - inizioSequenzaMs) >=
-                     uint64_t(indiceImpulso) * ultimoPeriodoMs / numeroImpulsi &&
+                     uint64_t(indiceImpulso) * periodoDistribuzioneMs / numeroImpulsi &&
                    uint32_t(now - inizioStatoMs) > 0) {
           ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
             if (!bloccaggioRichiesto) {
