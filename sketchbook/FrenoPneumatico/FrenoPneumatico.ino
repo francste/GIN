@@ -10,16 +10,13 @@ constexpr uint32_t ENCODER_HOLDOFF_US = 2000;
 constexpr uint32_t PRE_GONFIAGGIO_MS = 1500;
 constexpr uint32_t MOTOR_ON_TIMEOUT_MS = 200;   // Dalla fine dell'ultimo impulso di bloccaggio.
 constexpr uint32_t MS_PER_FRONTE = 600;
-constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 100;
-constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 70;
-constexpr uint16_t RICHIESTA_MINIMA_MS = IMPULSO_BLOCCAGGIO_MS + IMPULSO_MANTENIMENTO_MS;
-constexpr uint16_t RICHIESTA_INIZIALE_MS = RICHIESTA_MINIMA_MS; // 170 ms con questi parametri.
-constexpr uint16_t KP_PER_MILLE = 1000;        // Kp = 1.
-constexpr uint16_t RICHIESTA_MASSIMA_MS = 2000;
+constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 150;
+constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 100;
+constexpr uint32_t INTERVALLO_MANTENIMENTO_MS = 600; // Fra due avvii, indipendente dall'obiettivo.
 static_assert(IMPULSO_BLOCCAGGIO_MS > 0 && IMPULSO_MANTENIMENTO_MS > 0 &&
-              uint32_t(IMPULSO_BLOCCAGGIO_MS) + IMPULSO_MANTENIMENTO_MS <= RICHIESTA_MASSIMA_MS &&
-              MOTOR_ON_TIMEOUT_MS > 0,
-              "Servono durate positive e una richiesta massima sufficiente");
+              INTERVALLO_MANTENIMENTO_MS > IMPULSO_MANTENIMENTO_MS &&
+              MOTOR_ON_TIMEOUT_MS > 0 && MS_PER_FRONTE > 0,
+              "Servono durate positive e una pausa fra i mantenimenti");
 
 enum Stato { PRE_GONFIAGGIO, ATTENDI_FRONTE, MOTOR_ON, MANTENIMENTO, FERMO };
 Stato stato = FERMO;
@@ -32,14 +29,15 @@ uint32_t ultimoFronteValidoUs = 0;              // Usato soltanto nell'ISR.
 bool fronteValidoRicevuto = false;
 uint32_t ultimoTotaleLetto = 0;                 // Fronti gia' osservati dal main loop.
 
-uint16_t tempoRichiestoMs = RICHIESTA_INIZIALE_MS;
 bool precedenteSequenzaValida = false;
-bool correzioneDisponibile = false;
 uint32_t precedenteSequenzaMs = 0;
-uint32_t totaleAllaSequenza = 0;
 uint32_t inizioSequenzaMs = 0;
 uint32_t ultimoPeriodoMs = 0;                   // Dt congelato all'ingresso in MOTOR_ON.
-uint32_t frontiPeriodo = 0;                    // Contati sullo stesso intervallo di Dt.
+uint32_t frontiPrecedenti = 0;                // n del MOTOR_ON precedente, gia' completato.
+uint32_t frontiMotorOn = 0;                   // n attuale, compreso il fronte iniziale.
+uint32_t totalePrimaMotorOn = 0;              // Base del conteggio: prima del fronte iniziale.
+int64_t correzioneTempoMs = 0;                // t_corr accumulata, anche negativa.
+uint32_t durataMotorOnMs = 0;                 // Tempo nello stato, accensioni + pause + timeout.
 
 bool bloccaggioAcceso = false;
 uint32_t numeroBloccaggi = 0;
@@ -49,10 +47,10 @@ uint32_t ultimoSpegnimentoMs = 0;              // Retrigger del timeout a ogni f
 uint32_t ultimoImpulsoMs = 0;                  // Per la distanza fisica d nel log.
 
 bool mantenimentoAcceso = false;
-uint16_t numeroMantenimenti = 0;
-uint16_t indiceMantenimento = 0;               // Numero di mantenimenti completati.
-uint32_t residuoMantenimentoMs = 0;
-uint32_t periodoDistribuzioneMs = 0;
+uint32_t numeroMantenimenti = 0;
+uint32_t indiceMantenimento = 0;               // Numero di mantenimenti avviati.
+uint32_t durataMantenimentoMs = 0;            // t_m: durata della finestra, non somma degli HIGH.
+uint32_t inizioMantenimentoMs = 0;
 
 void encoderISR() {
   // Il debug copia anche i rimbalzi che il filtro scarta.
@@ -90,20 +88,34 @@ void stampaBloccaggio() {
   inviaLog(riga, lunghezza, sizeof(riga));
 }
 
-void stampaCorrezione(int16_t correzioneMs) {
+void stampaIntervallo() {
+  // snprintf AVR non supporta gli interi a 64 bit: converti t_corr in testo.
+  char correzione[22];
+  char *cifra = correzione + sizeof(correzione) - 1;
+  *cifra = '\0';
+  uint64_t valore = uint64_t(correzioneTempoMs < 0 ? -correzioneTempoMs : correzioneTempoMs);
+  do { *--cifra = char('0' + valore % 10); valore /= 10; } while (valore > 0);
+  *--cifra = correzioneTempoMs < 0 ? '-' : '+';
+  char riga[96];
+  const int lunghezza = snprintf(riga, sizeof(riga), "Dt:%10lu Np:%5lu Corr:%s\n",
+                                (unsigned long)ultimoPeriodoMs,
+                                (unsigned long)frontiPrecedenti, cifra);
+  inviaLog(riga, lunghezza, sizeof(riga));
+}
+
+void stampaDurate() {
   char riga[96];
   const int lunghezza = snprintf(riga, sizeof(riga),
-                                "Corr:%+5d Dt:%10lu Fr:%5lu Req:%4u On:%4lu M:%u\n",
-                                int(correzioneMs), (unsigned long)ultimoPeriodoMs,
-                                (unsigned long)frontiPeriodo, unsigned(tempoRichiestoMs),
-                                (unsigned long)tempoBloccaggioMs, unsigned(numeroMantenimenti));
+                                "Fr:%5lu On:%6lu Tm:%6lu M:%lu\n",
+                                (unsigned long)frontiMotorOn, (unsigned long)durataMotorOnMs,
+                                (unsigned long)durataMantenimentoMs, (unsigned long)numeroMantenimenti);
   inviaLog(riga, lunghezza, sizeof(riga));
 }
 
 void stampaMantenimento() {
   char riga[96];
-  const int lunghezza = snprintf(riga, sizeof(riga), "M:%u/%u t:%10lu d:%10lu\n",
-                                unsigned(indiceMantenimento + 1), unsigned(numeroMantenimenti),
+  const int lunghezza = snprintf(riga, sizeof(riga), "M:%lu/%lu t:%10lu d:%10lu\n",
+                                (unsigned long)indiceMantenimento, (unsigned long)numeroMantenimenti,
                                 (unsigned long)uint32_t(inizioImpulsoMs - inizioSequenzaMs),
                                 (unsigned long)uint32_t(inizioImpulsoMs - ultimoImpulsoMs));
   ultimoImpulsoMs = inizioImpulsoMs;
@@ -116,21 +128,10 @@ void cambiaStato(Stato nuovoStato) {
   ingressoStato = true;
 }
 
-uint16_t limitaRichiestaMs(int64_t richiestaMs) {
-  if (richiestaMs < RICHIESTA_MINIMA_MS) return RICHIESTA_MINIMA_MS;
-  if (richiestaMs > RICHIESTA_MASSIMA_MS) return RICHIESTA_MASSIMA_MS;
-  return uint16_t(richiestaMs);
-}
-
-int64_t correzioneProporzionaleMs(uint32_t periodoMs, uint32_t fronti) {
-  if (fronti == 0) return 0;                   // Nessun tempo medio misurabile.
-  // Corr = Kp * (600 - Dt/fronti). Calcolo intero senza troncare prima la media.
-  const int64_t erroreMs = int64_t(MS_PER_FRONTE) * fronti - periodoMs;
-  const int64_t numeratore = erroreMs * KP_PER_MILLE;
-  const int64_t denominatore = int64_t(fronti) * 1000;
-  // Arrotonda al ms piu' vicino, in entrambe le direzioni.
-  return (numeratore + (numeratore >= 0 ? denominatore / 2 : -denominatore / 2)) /
-         denominatore;
+uint32_t limitaDurataMs(int64_t durataMs) {
+  if (durataMs < 0) return 0;
+  if (durataMs > UINT32_MAX) return UINT32_MAX;
+  return uint32_t(durataMs);
 }
 
 void accendiBloccaggio() {
@@ -140,36 +141,45 @@ void accendiBloccaggio() {
   ++numeroBloccaggi;
 }
 
-void memorizzaIntervallo() {
-  // Come prima: tempo e fronti si riferiscono agli inizi di due episodi MOTOR_ON.
+void memorizzaIntervallo(uint32_t primaDeiFronti) {
+  // Chiudi il ciclo precedente prima di azzerare n per il nuovo MOTOR_ON.
+  frontiPrecedenti = precedenteSequenzaValida ? frontiMotorOn : 0;
+  ultimoPeriodoMs = precedenteSequenzaValida
+                    ? uint32_t(inizioSequenzaMs - precedenteSequenzaMs) : 0;
+  if (precedenteSequenzaValida) {
+    correzioneTempoMs += int64_t(ultimoPeriodoMs) - int64_t(frontiPrecedenti) * MS_PER_FRONTE;
+    // Limite numerico dei timer a 32 bit, senza il vecchio limite di richiesta a 2000 ms.
+    if (correzioneTempoMs > int64_t(UINT32_MAX)) correzioneTempoMs = UINT32_MAX;
+    if (correzioneTempoMs < -int64_t(UINT32_MAX)) correzioneTempoMs = -int64_t(UINT32_MAX);
+  }
+  precedenteSequenzaMs = inizioSequenzaMs;
+  precedenteSequenzaValida = true;
+  totalePrimaMotorOn = primaDeiFronti;
   const uint32_t totale = leggiEncoder();
   ultimoTotaleLetto = totale;
-  correzioneDisponibile = precedenteSequenzaValida;
-  ultimoPeriodoMs = correzioneDisponibile ? uint32_t(inizioSequenzaMs - precedenteSequenzaMs) : 0;
-  frontiPeriodo = correzioneDisponibile ? uint32_t(totale - totaleAllaSequenza) : 0;
-  precedenteSequenzaMs = inizioSequenzaMs;
-  totaleAllaSequenza = totale;
-  precedenteSequenzaValida = true;
+  frontiMotorOn = uint32_t(totale - totalePrimaMotorOn); // Include tutti i fronti della prima lettura.
 }
 
-void concludiBloccaggio() {
-  const uint16_t precedenteRichiestaMs = tempoRichiestoMs;
-  if (correzioneDisponibile) {
-    tempoRichiestoMs = limitaRichiestaMs(int64_t(tempoRichiestoMs) +
-                      correzioneProporzionaleMs(ultimoPeriodoMs, frontiPeriodo));
-  }
-  // Se il bloccaggio ha gia' consumato la richiesta, il residuo e' zero.
-  residuoMantenimentoMs = tempoBloccaggioMs < tempoRichiestoMs
-                          ? tempoRichiestoMs - tempoBloccaggioMs : 0;
-  numeroMantenimenti = residuoMantenimentoMs / IMPULSO_MANTENIMENTO_MS;
-  periodoDistribuzioneMs = ultimoPeriodoMs > 0 ? ultimoPeriodoMs : MS_PER_FRONTE;
-  stampaCorrezione(int16_t(tempoRichiestoMs) - int16_t(precedenteRichiestaMs));
+void preparaMantenimento() {
+  inizioMantenimentoMs = millis();
+  durataMotorOnMs = uint32_t(inizioMantenimentoMs - inizioSequenzaMs);
+  const int64_t tempoMs = int64_t(frontiMotorOn) * MS_PER_FRONTE -
+                         durataMotorOnMs - correzioneTempoMs;
+  durataMantenimentoMs = limitaDurataMs(tempoMs);
+  // Primo mantenimento all'ingresso; gli altri ogni 600 ms. Soltanto impulsi completi.
+  numeroMantenimenti = durataMantenimentoMs < IMPULSO_MANTENIMENTO_MS ? 0 :
+                      1 + (durataMantenimentoMs - IMPULSO_MANTENIMENTO_MS) / INTERVALLO_MANTENIMENTO_MS;
+  indiceMantenimento = 0;
+  mantenimentoAcceso = false;
+  stampaDurate();
 }
 
 void aggiornaFreno(uint32_t now) {
+  const uint32_t primaDeiFronti = ultimoTotaleLetto;
   const uint32_t totale = leggiEncoder();
   bool nuovoFronte = totale != ultimoTotaleLetto;
   ultimoTotaleLetto = totale;                 // Nessuna coda di fronti durante un'accensione.
+  if (stato == MOTOR_ON && !ingressoStato) frontiMotorOn = uint32_t(totale - totalePrimaMotorOn);
 
   // Ogni transizione esegue subito il ONCE del nuovo stato nello stesso loop.
   for (;;) {
@@ -178,12 +188,12 @@ void aggiornaFreno(uint32_t now) {
     switch (stato) {
       case PRE_GONFIAGGIO:
         if (once) {                            // ONCE: ripristina e accendi il pregonfiaggio.
-          tempoRichiestoMs = limitaRichiestaMs(RICHIESTA_INIZIALE_MS);
-          precedenteSequenzaValida = correzioneDisponibile = false;
-          ultimoPeriodoMs = frontiPeriodo = 0;
+          precedenteSequenzaValida = false;
+          correzioneTempoMs = 0;
+          ultimoPeriodoMs = frontiPrecedenti = frontiMotorOn = 0;
+          durataMotorOnMs = durataMantenimentoMs = 0;
           numeroBloccaggi = tempoBloccaggioMs = 0;
           numeroMantenimenti = indiceMantenimento = 0;
-          residuoMantenimentoMs = periodoDistribuzioneMs = 0;
           bloccaggioAcceso = mantenimentoAcceso = false;
           inizioStatoMs = now;
           digitalWrite(MOTOR_PIN, HIGH);
@@ -197,7 +207,10 @@ void aggiornaFreno(uint32_t now) {
         break;
 
       case ATTENDI_FRONTE:
-        if (once) digitalWrite(MOTOR_PIN, LOW); // ONCE: termina il pregonfiaggio.
+        if (once) {                            // ONCE: termina pregonfiaggio o mantenimento.
+          digitalWrite(MOTOR_PIN, LOW);
+          mantenimentoAcceso = false;
+        }
         // ALWAYS: al primo fronte inizia MOTOR_ON, senza un'altra attesa temporizzata.
         if (nuovoFronte) {
           nuovoFronte = false;
@@ -211,11 +224,12 @@ void aggiornaFreno(uint32_t now) {
           mantenimentoAcceso = false;
           numeroBloccaggi = tempoBloccaggioMs = 0;
           numeroMantenimenti = indiceMantenimento = 0;
-          residuoMantenimentoMs = 0;
+          durataMotorOnMs = durataMantenimentoMs = 0;
           accendiBloccaggio();
           inizioSequenzaMs = inizioStatoMs = inizioImpulsoMs;
-          memorizzaIntervallo();
+          memorizzaIntervallo(primaDeiFronti);
           stampaBloccaggio();
+          stampaIntervallo();                  // t_corr si aggiorna soltanto all'ingresso.
           nuovoFronte = false;
           now = millis();
         }
@@ -233,16 +247,15 @@ void aggiornaFreno(uint32_t now) {
           accendiBloccaggio();
           stampaBloccaggio();
         } else if (uint32_t(now - ultimoSpegnimentoMs) >= MOTOR_ON_TIMEOUT_MS) {
-          concludiBloccaggio();                // Correggi una sola volta, dopo l'arresto presunto.
           cambiaStato(MANTENIMENTO);
           continue;
         }
         break;
 
-      case MANTENIMENTO:
-        if (once) {                            // ONCE: prepara solo la parte residua.
-          indiceMantenimento = 0;
-          mantenimentoAcceso = false;
+      case MANTENIMENTO: {
+        if (once) {                            // ONCE: calcola t_m dal nuovo n e dal tempo nello stato.
+          preparaMantenimento();
+          now = millis();
         }
         // ALWAYS: il primo fronte annulla i mantenimenti e torna subito a MOTOR_ON.
         if (nuovoFronte) {
@@ -250,26 +263,29 @@ void aggiornaFreno(uint32_t now) {
           cambiaStato(MOTOR_ON);
           continue;
         }
+        const uint32_t trascorsoMs = uint32_t(now - inizioMantenimentoMs);
+        if (trascorsoMs >= durataMantenimentoMs) {
+          cambiaStato(ATTENDI_FRONTE);          // Finestra conclusa: niente altri mantenimenti.
+          continue;
+        }
         if (mantenimentoAcceso) {
           if (uint32_t(now - inizioImpulsoMs) >= IMPULSO_MANTENIMENTO_MS) {
             digitalWrite(MOTOR_PIN, LOW);
             mantenimentoAcceso = false;
-            ++indiceMantenimento;
             ultimoSpegnimentoMs = now;
           }
-        } else if (indiceMantenimento < numeroMantenimenti &&
-                   uint32_t(now - inizioSequenzaMs) >=
-                     uint64_t(indiceMantenimento + 1) * periodoDistribuzioneMs / (numeroMantenimenti + 1) &&
-                   uint32_t(now - ultimoImpulsoMs) >= periodoDistribuzioneMs / (numeroMantenimenti + 1) &&
-                   uint32_t(now - ultimoSpegnimentoMs) > 0) {
-          // Intervalli regolari anche con loop in ritardo; nessuna distanza minima impostata.
+        } else if ((indiceMantenimento == 0 ||
+                    uint32_t(now - ultimoImpulsoMs) >= INTERVALLO_MANTENIMENTO_MS) &&
+                   durataMantenimentoMs - trascorsoMs >= IMPULSO_MANTENIMENTO_MS) {
+          // Non recuperare scadenze arretrate con una raffica; conserva 600 ms fra avvii reali.
           digitalWrite(MOTOR_PIN, HIGH);
           mantenimentoAcceso = true;
           inizioImpulsoMs = millis();
+          ++indiceMantenimento;
           stampaMantenimento();
         }
-        // Dopo l'ultimo mantenimento rimane qui in attesa del fronte, senza timeout.
         break;
+      }
 
       case FERMO:
         if (once) digitalWrite(MOTOR_PIN, LOW); // ONCE: spegni; ALWAYS: attendi il comando a.
