@@ -12,7 +12,6 @@ constexpr uint32_t TIMEOUT_ARRESTO_MS = 300;
 constexpr uint32_t MS_PER_FRONTE = 600;
 constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 150; // Prima accensione di ogni sequenza.
 constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 70;
-constexpr uint32_t DISTANZA_MINIMA_IMPULSI_MS = 500; // Fra gli avvii, compreso il bloccaggio.
 constexpr uint16_t RICHIESTA_MINIMA_MS = IMPULSO_BLOCCAGGIO_MS + IMPULSO_MANTENIMENTO_MS;
 constexpr uint16_t RICHIESTA_INIZIALE_MS = RICHIESTA_MINIMA_MS; // 220 ms: blocco + mantenimento.
 constexpr uint16_t KP_PER_MILLE = 100;         // Kp = 0,10 ms di correzione per ms di errore medio.
@@ -64,7 +63,7 @@ void encoderISR() {
     digitalWrite(MOTOR_PIN, HIGH);             // Prima di calcoli, log e prossimo loop.
     bloccaggioMs = millis();
     bloccaggioFronti = encoderTotale;
-    encoderPronto = false;                    // Conta soltanto fino alla fine di tutta la sequenza.
+    encoderPronto = false;                    // Gli altri fronti si contano fino alla fine dei 150 ms.
     bloccaggioRichiesto = true;
   }
 }
@@ -150,14 +149,8 @@ void preparaSequenza(uint32_t now, uint32_t totale) {
 
   // Il minimo di 220 ms garantisce blocco da 150 ms + almeno un mantenimento da 70 ms.
   numeroImpulsi = 1 + (tempoRichiestoMs - IMPULSO_BLOCCAGGIO_MS) / IMPULSO_MANTENIMENTO_MS;
-  // Senza Dt, o con Dt corto, usa almeno 500 ms fra gli avvii.
-  periodoDistribuzioneMs = ultimoPeriodoMs;
-  const uint16_t impulsoPiuLungoMs = IMPULSO_BLOCCAGGIO_MS > IMPULSO_MANTENIMENTO_MS
-                                     ? IMPULSO_BLOCCAGGIO_MS : IMPULSO_MANTENIMENTO_MS;
-  const uint32_t distanzaMinimaMs = DISTANZA_MINIMA_IMPULSI_MS > impulsoPiuLungoMs
-                                    ? DISTANZA_MINIMA_IMPULSI_MS : uint32_t(impulsoPiuLungoMs) + 1;
-  const uint32_t periodoMinimoMs = uint32_t(numeroImpulsi) * distanzaMinimaMs;
-  if (periodoDistribuzioneMs < periodoMinimoMs) periodoDistribuzioneMs = periodoMinimoMs;
+  // Distribuisci sul Dt misurato; soltanto al primo avvio usa 600 ms.
+  periodoDistribuzioneMs = ultimoPeriodoMs > 0 ? ultimoPeriodoMs : MS_PER_FRONTE;
 }
 
 void aggiornaFreno(uint32_t now) {
@@ -174,7 +167,7 @@ void aggiornaFreno(uint32_t now) {
   }
   if (nuovoBloccaggio) {
     now = millis();                          // Il fronte puo' essere arrivato dopo il now del loop.
-    indiceImpulso = 0;                        // Nuova sequenza, soltanto dopo l'attesa di un fronte.
+    indiceImpulso = 0;                        // Il fronte annulla i mantenimenti della vecchia sequenza.
     cambiaStato(MOTOR_ON);
   }
 
@@ -239,23 +232,24 @@ void aggiornaFreno(uint32_t now) {
         break;
 
       case MANTENIMENTO:
-        if (once) {                            // ONCE: termina il blocco e prepara solo i mantenimenti.
+        if (once) {                            // ONCE: termina il blocco e attendi subito un nuovo fronte.
           indiceImpulso = 1;
           mantenimentoAcceso = false;
           inizioStatoMs = now;
-          digitalWrite(MOTOR_PIN, LOW);        // I fronti vengono contati, senza riavviare il blocco.
+          attendiEncoder();
         }
-        // ALWAYS: completa gli impulsi da 70 ms; i fronti encoder vengono soltanto contati.
+        // ALWAYS: genera i mantenimenti, poi resta qui in attesa del fronte, senza timeout.
         if (mantenimentoAcceso) {
           if (uint32_t(now - inizioStatoMs) >= IMPULSO_MANTENIMENTO_MS) {
-            mantenimentoAcceso = false;
-            ++indiceImpulso;
-            inizioStatoMs = now;
-            if (indiceImpulso == numeroImpulsi) {
-              cambiaStato(ATTENDI_FRONTE);      // Solo ora riabilita l'accensione su un nuovo fronte.
-              continue;
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+              // Un fronte arrivato durante questo loop deve lasciare il motore acceso.
+              if (!bloccaggioRichiesto) {
+                digitalWrite(MOTOR_PIN, LOW);
+                mantenimentoAcceso = false;
+                ++indiceImpulso;
+                inizioStatoMs = now;
+              }
             }
-            digitalWrite(MOTOR_PIN, LOW);
           }
         } else if (indiceImpulso < numeroImpulsi &&
                    uint32_t(now - inizioSequenzaMs) >=
@@ -263,10 +257,16 @@ void aggiornaFreno(uint32_t now) {
                    uint32_t(now - ultimoImpulsoMs) >= periodoDistribuzioneMs / numeroImpulsi &&
                    uint32_t(now - inizioStatoMs) > 0) {
           // Conserva la distanza anche se il loop ha osservato una scadenza in ritardo.
-          digitalWrite(MOTOR_PIN, HIGH);
-          mantenimentoAcceso = true;
-          inizioStatoMs = millis();           // Timestamp dell'accensione effettiva.
-          stampaImpulso(0);
+          bool avvioMantenimento = false;
+          ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+            if (!bloccaggioRichiesto) {
+              digitalWrite(MOTOR_PIN, HIGH);
+              mantenimentoAcceso = true;
+              inizioStatoMs = millis();       // Timestamp dell'accensione effettiva.
+              avvioMantenimento = true;
+            }
+          }
+          if (avvioMantenimento) stampaImpulso(0);
         }
         break;
 
