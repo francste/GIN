@@ -12,7 +12,7 @@ stateDiagram-v2
     [*] --> PRE_GONFIAGGIO
     PRE_GONFIAGGIO --> ATTENDI_FRONTE: 1500 ms
     ATTENDI_FRONTE --> MOTOR_ON: primo fronte valido
-    MOTOR_ON --> MOTOR_ON: nuovo fronte a motore spento, impulso da 150 ms
+    MOTOR_ON --> MOTOR_ON: nuovo fronte a motore spento, se S=0
     MOTOR_ON --> MANTENIMENTO: 200 ms dalla fine dell'ultimo impulso
     MANTENIMENTO --> MANTENIMENTO: impulsi da 100 ms ogni 600 ms
     MANTENIMENTO --> MOTOR_ON: primo fronte valido
@@ -23,7 +23,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `PRE_GONFIAGGIO` | Azzera campioni e correzione; accende il motore | Dopo 1500 ms passa direttamente a `ATTENDI_FRONTE` |
 | `ATTENDI_FRONTE` | Spegne il motore | Al primo fronte valido passa a `MOTOR_ON` |
-| `MOTOR_ON` | Accende il primo impulso; memorizza Dt e aggiorna t_corr usando n precedente; inizia il nuovo conteggio n | Termina gli impulsi dopo 150 ms; un nuovo fronte a motore spento genera un altro impulso; dopo 200 ms dall'ultimo spegnimento passa al mantenimento |
+| `MOTOR_ON` | Accende il primo impulso; aggiorna Dt e t_corr; sceglie la modalita' S e inizia il nuovo conteggio n | Termina gli impulsi dopo 150 ms; in S=0 un fronte a motore spento genera un altro impulso; in S=1 esegue soltanto il primo; dopo 200 ms dall'ultimo spegnimento passa al mantenimento |
 | `MANTENIMENTO` | Calcola t_m dal nuovo n e dalla durata completa di MOTOR_ON | Genera impulsi da 100 ms ogni 600 ms; al primo fronte torna a `MOTOR_ON`; a fine t_m passa a `ATTENDI_FRONTE` |
 | `FERMO` | Spegne il motore | Attende il comando `a` |
 
@@ -33,11 +33,11 @@ consumati senza avviare o accodare bloccaggi. Anche un fronte osservato
 nel loop che termina il pregonfiaggio viene consumato: serve un nuovo
 fronte dopo l'ingresso in `ATTENDI_FRONTE`.
 
-## Bloccaggio con piu' impulsi
+## Bloccaggio normale e singolo
 
 Ogni accensione in `MOTOR_ON` dura `IMPULSO_BLOCCAGGIO_MS`, **150 ms**.
 Alla fine il motore si spegne e riparte `MOTOR_ON_TIMEOUT_MS`, **200 ms**,
-misurato dallo spegnimento effettivo.
+misurato dallo spegnimento effettivo. In modalita' normale (`S:0`):
 
 - Un fronte durante HIGH viene contato, senza prolungare l'impulso,
   retriggerare il timeout o accodare altre accensioni.
@@ -51,8 +51,47 @@ misurato dallo spegnimento effettivo.
 Il numero di bloccaggi dipende dai fronti: per esempio possono servire
 2, 3 o 4 impulsi. Quando scadono 200 ms senza un nuovo fronte a motore
 spento, il controllo considera il freno arrestato e passa a `MANTENIMENTO`.
-Questa logica rimane quella della versione precedente; cambiano la durata
-parametrica e il calcolo della finestra successiva.
+La modalita' normale consente cosi' piu' accensioni per arrestare il freno.
+
+### Recupero della correzione positiva
+
+All'ingresso in `MOTOR_ON`, dopo aver aggiornato t_corr, il controllo
+sceglie il bloccaggio singolo (`S:1`) se entrambe le condizioni sono vere:
+
+```text
+t_corr > 0
+nel ciclo precedente il numero nominale di mantenimenti era zero
+```
+
+Questo include finestre nulle e finestre inferiori ai 100 ms necessari
+per un mantenimento completo. Il primo ciclo parte in modalita' normale.
+La scelta resta fissata per tutto lo stato, anche se i nuovi fronti
+aumentano n e rendono nuovamente possibile il mantenimento.
+
+In S=1 si esegue un solo bloccaggio da 150 ms. I fronti durante HIGH e
+durante i successivi 200 ms vengono tutti contati, senza avviare altre
+accensioni o spostare il timeout. Lo stato termina 200 ms dopo lo
+spegnimento del primo impulso: nominalmente 350 ms dall'ingresso,
+anche se continuano ad arrivare fronti.
+
+Anche un fronte osservato nel loop della scadenza viene contato e
+consumato da MOTOR_ON; non viene inoltrato al nuovo stato. Un nuovo
+fronte dopo l'uscita puo' invece riavviare subito MOTOR_ON da mantenimento
+o attesa, secondo la logica consueta.
+
+Il timeout in S=1 non conferma necessariamente l'arresto: serve a
+ridurre la frenata lasciando contare piu' fronti. Al prossimo ingresso,
+un n precedente maggiore aumenta il termine sottratto nella correzione,
+favorendo il recupero di t_corr positiva. Quando t_corr non e' piu'
+positiva, oppure il ciclo precedente prevede di nuovo mantenimenti,
+il nuovo MOTOR_ON torna in S=0 e puo' ripetere i bloccaggi.
+
+Esempio simulato: con Corr=1400 ms e nessun mantenimento precedente,
+il bloccaggio singolo conta tre fronti in 350 ms. Al successivo ingresso
+dopo Dt=600 ms, la correzione diventa 1400+600-3*600=200 ms.
+Con altri tre fronti e una durata MOTOR_ON di 350 ms, la nuova finestra
+e' 1800-350-200=1250 ms e prevede due mantenimenti. Il ciclo successivo
+puo' quindi riprendere i bloccaggi multipli anche se Corr resta positiva.
 
 ## Conteggi e correzione accumulata
 
@@ -164,10 +203,13 @@ con il tempo di rilascio del sistema; se si sblocca prima, il fronte
 interrompe subito il mantenimento come previsto.
 
 Con t_m=0 non e' possibile abbreviare ulteriormente il ciclo tramite
-mantenimento. Se il bloccaggio, il timeout e il rilascio richiedono piu'
-del tempo obiettivo, la correzione accumulata puo' continuare a crescere:
-questa versione non aggiunge un anti-windup dinamico. Il raggiungimento
-della cadenza dipende dalla possibilita' fisica di regolarla.
+mantenimento. Il bloccaggio singolo riduce allora le accensioni ripetute
+quando la correzione resta positiva e mancano i mantenimenti. L'accumulo
+di t_corr rimane attivo; il recupero dipende dai fronti effettivamente
+ottenuti, senza azzeramenti artificiali della correzione. Se anche un
+solo impulso, il timeout e il rilascio richiedono piu' del tempo obiettivo,
+la correzione puo' ancora crescere: la possibilita' di regolare la cadenza
+dipende dalla risposta fisica del sistema.
 
 I prodotti e le differenze usano 64 bit con segno. La finestra viene
 limitata a `0..UINT32_MAX` ms, la correzione a `-UINT32_MAX..UINT32_MAX` ms,
@@ -241,7 +283,7 @@ Il log dell'esempio con tre bloccaggi e n=3 e':
 
 ```text
 B:1 Imp:150 t:         0 d:         0
-Dt:         0 Np:    0 Corr:+0
+Dt:         0 Np:    0 Corr:+0 S:0
 B:2 Imp:150 t:       170 d:       170
 B:3 Imp:150 t:       340 d:       170
 Fr:    3 On:   690 Tm:  1110 M:2
@@ -250,8 +292,9 @@ M:2/2 t:      1290 d:       600
 ```
 
 - `B` numera i bloccaggi; `Imp` e' la durata parametrica.
-- `Dt`, `Np`, `Corr` compaiono soltanto all'ingresso in `MOTOR_ON`:
+- `Dt`, `Np`, `Corr`, `S` compaiono soltanto all'ingresso in `MOTOR_ON`:
   intervallo dal precedente ingresso, n precedente e correzione accumulata.
+  `S:1` indica bloccaggio singolo, `S:0` bloccaggi multipli consentiti.
 - `Fr`, `On`, `Tm`, `M` compaiono al termine del bloccaggio: n attuale,
   tempo completo in MOTOR_ON, finestra t_m e numero nominale di mantenimenti.
 - `M:1/2` numera i mantenimenti avviati, senza ripetere Dt o Corr.
@@ -294,7 +337,7 @@ La toolchain cloud e' Arduino CLI 1.4.1, megaAVR 1.8.8, API 1.3.1 e AVR GCC
 Debian 14.2.0, diverso dal compilatore del pacchetto Arduino standard.
 Il caricamento USB non e' verificato.
 
-I **33 gruppi di test** simulati coprono GPIO, pregonfiaggio diretto,
+I **40 gruppi di test** simulati coprono GPIO, pregonfiaggio diretto,
 debug/holdoff, ISR senza comandi motore, ONCE/ALWAYS, bloccaggi da 150 ms,
 due-quattro accensioni, fronti durante HIGH senza coda, timeout retriggerato
 allo spegnimento, fronti sulle scadenze, separazione dei conteggi fra cicli,
@@ -302,7 +345,11 @@ correzione accumulata una sola volta, segno della correzione, tempo completo
 nello stato, impulsi da 100 ms ogni 600 ms, finestre corte e negative,
 interruzione del mantenimento, scadenza e attesa, loop in ritardo,
 rollover di tempo e contatore, calcoli a 64 bit, limiti numerici,
-stop/riavvio, seriale congestionata e log saltati.
+stop/riavvio, seriale congestionata e log saltati. Le verifiche del
+bloccaggio singolo coprono condizioni d'ingresso, conteggio durante HIGH
+e LOW senza retrigger, fronte sulla scadenza, recupero della correzione
+e ritorno ai bloccaggi multipli, stop/riavvio, seriale congestionata e
+rollover di timer e contatore.
 
 Un modello pneumatico semplificato, con quattro fronti per movimento e
 sblocco 800 ms dopo l'ultimo spegnimento, simula 100 cicli e misura

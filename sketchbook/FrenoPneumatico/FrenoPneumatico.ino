@@ -40,6 +40,7 @@ int64_t correzioneTempoMs = 0;                // t_corr accumulata, anche negati
 uint32_t durataMotorOnMs = 0;                 // Tempo nello stato, accensioni + pause + timeout.
 
 bool bloccaggioAcceso = false;
+bool soloPrimoBloccaggio = false;             // Modalita' fissata all'ingresso in MOTOR_ON.
 uint32_t numeroBloccaggi = 0;
 uint32_t tempoBloccaggioMs = 0;                // Somma dei tempi effettivamente accesi.
 uint32_t inizioImpulsoMs = 0;
@@ -97,9 +98,9 @@ void stampaIntervallo() {
   do { *--cifra = char('0' + valore % 10); valore /= 10; } while (valore > 0);
   *--cifra = correzioneTempoMs < 0 ? '-' : '+';
   char riga[96];
-  const int lunghezza = snprintf(riga, sizeof(riga), "Dt:%10lu Np:%5lu Corr:%s\n",
+  const int lunghezza = snprintf(riga, sizeof(riga), "Dt:%10lu Np:%5lu Corr:%s S:%u\n",
                                 (unsigned long)ultimoPeriodoMs,
-                                (unsigned long)frontiPrecedenti, cifra);
+                                (unsigned long)frontiPrecedenti, cifra, unsigned(soloPrimoBloccaggio));
   inviaLog(riga, lunghezza, sizeof(riga));
 }
 
@@ -194,7 +195,7 @@ void aggiornaFreno(uint32_t now) {
           durataMotorOnMs = durataMantenimentoMs = 0;
           numeroBloccaggi = tempoBloccaggioMs = 0;
           numeroMantenimenti = indiceMantenimento = 0;
-          bloccaggioAcceso = mantenimentoAcceso = false;
+          bloccaggioAcceso = mantenimentoAcceso = soloPrimoBloccaggio = false;
           inizioStatoMs = now;
           digitalWrite(MOTOR_PIN, HIGH);
         }
@@ -221,6 +222,7 @@ void aggiornaFreno(uint32_t now) {
 
       case MOTOR_ON:
         if (once) {                            // ONCE: primo impulso, nuovo timer e Dt congelato.
+          const bool senzaMantenimentiPrima = precedenteSequenzaValida && numeroMantenimenti == 0;
           mantenimentoAcceso = false;
           numeroBloccaggi = tempoBloccaggioMs = 0;
           numeroMantenimenti = indiceMantenimento = 0;
@@ -228,11 +230,15 @@ void aggiornaFreno(uint32_t now) {
           accendiBloccaggio();
           inizioSequenzaMs = inizioStatoMs = inizioImpulsoMs;
           memorizzaIntervallo(primaDeiFronti);
+          // Riduci la frenata se la correzione positiva ha gia' escluso il mantenimento.
+          soloPrimoBloccaggio = senzaMantenimentiPrima && correzioneTempoMs > 0;
           stampaBloccaggio();
           stampaIntervallo();                  // t_corr si aggiorna soltanto all'ingresso.
           nuovoFronte = false;
           now = millis();
         }
+        // In modalita' singola i fronti aggiornano n, ma non riaccendono o passano al nuovo stato.
+        if (soloPrimoBloccaggio) nuovoFronte = false;
         // ALWAYS: un fronte durante HIGH si conta, ma non accoda un altro impulso.
         if (bloccaggioAcceso) {
           if (uint32_t(now - inizioImpulsoMs) >= IMPULSO_BLOCCAGGIO_MS) {
