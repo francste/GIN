@@ -43,7 +43,7 @@ uint32_t frontiMotorOn = 0;                   // n attuale, compreso il fronte i
 uint32_t totalePrimaMotorOn = 0;              // Base del conteggio: prima del fronte iniziale.
 int64_t correzioneTempoMs = 0;                // t_corr accumulata, anche negativa.
 uint32_t durataMotorOnMs = 0;                 // Tempo nello stato, accensioni + pause + timeout.
-bool mantenimentoInibito = false;            // Corr > 0 all'ingresso: nessun mantenimento in questo ciclo.
+bool recuperoAttivo = false;                 // Corr > 0 all'ingresso: un solo B, niente mantenimento.
 
 bool bloccaggioAcceso = false;
 uint32_t fronteAvvioBloccaggio = 1;           // Fronte atteso per il primo B, fissato all'ingresso.
@@ -203,7 +203,7 @@ void preparaMantenimento() {
   const int64_t tempoMs = int64_t(frontiMotorOn) * MS_PER_FRONTE -
                          durataMotorOnMs - correzioneTempoMs;
   // La decisione e' congelata all'ingresso: nuovi fronti non riabilitano il mantenimento.
-  durataMantenimentoMs = mantenimentoInibito ? 0 : limitaDurataMs(tempoMs);
+  durataMantenimentoMs = recuperoAttivo ? 0 : limitaDurataMs(tempoMs);
   // Primo mantenimento all'ingresso; gli altri ogni 600 ms. Soltanto impulsi completi.
   numeroMantenimenti = durataMantenimentoMs < IMPULSO_MANTENIMENTO_MS ? 0 :
                       1 + (durataMantenimentoMs - IMPULSO_MANTENIMENTO_MS) / INTERVALLO_MANTENIMENTO_MS;
@@ -228,7 +228,7 @@ void aggiornaFreno(uint32_t now) {
         if (once) {                            // ONCE: ripristina e accendi il pregonfiaggio.
           precedenteSequenzaValida = false;
           correzioneTempoMs = 0;
-          mantenimentoInibito = false;
+          recuperoAttivo = false;
           ultimoPeriodoMs = frontiPrecedenti = frontiMotorOn = 0;
           durataMotorOnMs = durataMantenimentoMs = 0;
           numeroBloccaggi = tempoBloccaggioMs = 0;
@@ -271,7 +271,7 @@ void aggiornaFreno(uint32_t now) {
           durataMotorOnMs = durataMantenimentoMs = 0;
           inizioSequenzaMs = inizioStatoMs = millis();
           memorizzaIntervallo(primaDeiFronti);
-          mantenimentoInibito = correzioneTempoMs > 0;
+          recuperoAttivo = correzioneTempoMs > 0;
           fronteAvvioBloccaggio = senzaMantenimentoPrima
                                  ? calcolaFronteAvvio(correzioneTempoMs) : 1;
           // Con mantenimenti precedenti Av=1: riparti subito, senza un passaggio LOW.
@@ -286,6 +286,9 @@ void aggiornaFreno(uint32_t now) {
           if (once) stampaIntervallo();        // Corr positiva, zero o negativa: una volta per ciclo.
           break;
         }
+        // In recupero conta i fronti, ma non riaccende ne' retriggera il timeout.
+        // Consuma anche il fronte alla scadenza: non deve aprire un altro ciclo nello stesso loop.
+        if (recuperoAttivo) nuovoFronte = false;
         // ALWAYS: un fronte durante HIGH si conta, ma non accoda un altro impulso.
         if (bloccaggioAcceso) {
           if (uint32_t(now - inizioImpulsoMs) >= IMPULSO_BLOCCAGGIO_MS) {
@@ -377,7 +380,7 @@ void setup() {
   digitalWrite(DEBUG_PIN, digitalRead(ENCODER_PIN));
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, CHANGE);
   Serial.begin(115200);
-  Serial.println(F("Avvio freno - ritardo limitato e mantenimento inibito con Corr>0"));
+  Serial.println(F("Avvio freno - Corr>0: un solo bloccaggio, niente mantenimento"));
   Serial.print(F("Ritardo massimo (fronti aggiuntivi): "));
   Serial.println(MAX_FRONTI_RITARDO_BLOCCAGGIO);
   Serial.println(F("Legenda log (tempi in ms):"));

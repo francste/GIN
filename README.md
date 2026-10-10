@@ -13,7 +13,7 @@ stateDiagram-v2
     PRE_GONFIAGGIO --> ATTENDI_FRONTE: 1500 ms
     ATTENDI_FRONTE --> MOTOR_ON: primo fronte valido
     MOTOR_ON --> MOTOR_ON: se Corr positiva e nessun mantenimento precedente, attende Av
-    MOTOR_ON --> MOTOR_ON: nuovo fronte dopo lo spegnimento, altro B
+    MOTOR_ON --> MOTOR_ON: Corr ingresso non positiva, nuovo fronte dopo spegnimento, altro B
     MOTOR_ON --> MANTENIMENTO: 200 ms dall'ultimo spegnimento B
     MANTENIMENTO --> MANTENIMENTO: impulsi da 100 ms ogni 600 ms
     MANTENIMENTO --> MOTOR_ON: primo fronte valido
@@ -24,7 +24,7 @@ stateDiagram-v2
 | --- | --- | --- |
 | `PRE_GONFIAGGIO` | Azzera campioni e correzione; accende il motore | Dopo 1500 ms passa a `ATTENDI_FRONTE` |
 | `ATTENDI_FRONTE` | Spegne il motore | Al primo fronte passa a `MOTOR_ON` |
-| `MOTOR_ON` | Salva se il ciclo precedente ha eseguito mantenimenti; memorizza Dt, aggiorna Corr, sceglie Av, congela l'inibizione del mantenimento e inizia il nuovo n | Primo B immediato, oppure attende Av entro il limite di fronti; poi bloccaggi da 150 ms; dopo 200 ms dall'ultimo spegnimento prepara il mantenimento |
+| `MOTOR_ON` | Salva se il ciclo precedente ha eseguito mantenimenti; memorizza Dt, aggiorna Corr, sceglie Av, congela la modalita' recupero e inizia il nuovo n | Primo B immediato, oppure attende Av entro il limite di fronti; con Corr positiva un solo B da 150 ms; altrimenti altri B su nuovi fronti a motore spento; dopo 200 ms dall'ultimo spegnimento prepara il mantenimento |
 | `MANTENIMENTO` | Calcola t_m; lo forza a zero se Corr era positiva all'ingresso in MOTOR_ON | Con t_m=0 passa subito a `ATTENDI_FRONTE`; altrimenti impulsi da 100 ms ogni 600 ms; al primo fronte torna a `MOTOR_ON`; a fine t_m passa a `ATTENDI_FRONTE` |
 | `FERMO` | Spegne il motore | Attende il comando `a` |
 
@@ -53,7 +53,7 @@ Corr += Dt - n_precedente * MS_PER_FRONTE
 ritarda = ciclo_precedente_valido && mantenimenti_avviati_precedenti == 0 && Corr > 0
 Av = 1                                         se non ritarda
 Av = 1 + min(ceil(Corr / MS_CORR_PER_FRONTE_ATTESO), MAX_FRONTI_RITARDO_BLOCCAGGIO)   se ritarda
-mantenimento_inibito = Corr > 0
+recupero = Corr > 0
 ```
 
 `MS_CORR_PER_FRONTE_ATTESO` vale inizialmente **600 ms**, come
@@ -93,7 +93,7 @@ la correzione al prossimo ingresso. Non si azzera artificialmente Corr.
 L'efficacia dipende dalla risposta fisica: il limite dei fronti evita
 attese troppo lunghe, ma non garantisce il recupero della correzione.
 
-## Bloccaggi dopo il raggiungimento di Av
+## Bloccaggi e modalita' recupero
 
 Ogni impulso dura `IMPULSO_BLOCCAGGIO_MS`, **150 ms** nel repository;
 il valore rimane parametrico. Alla fine il motore si spegne e riparte
@@ -101,18 +101,28 @@ il valore rimane parametrico. Alla fine il motore si spegne e riparte
 
 - I fronti durante HIGH vengono contati, senza prolungare l'impulso o
   accodare altre accensioni.
-- Un nuovo fronte a motore spento genera un altro B, senza cambiare
-  Corr, Av o l'istante iniziale del ciclo.
+- Con **Corr positiva all'ingresso**, si genera **un solo B**. Tutti i
+  fronti durante l'accensione e nei 200 ms successivi vengono contati,
+  ma non riaccendono il motore e non retriggerano il timeout.
+- Con **Corr zero o negativa all'ingresso**, un nuovo fronte a motore
+  spento genera un altro B, senza cambiare Corr, Av o l'istante iniziale
+  del ciclo. Ogni nuovo spegnimento retriggera i 200 ms.
 - Un fronte osservato nel loop che spegne B viene consumato mentre
   il motore e' ancora acceso; serve un fronte successivo.
-- Un fronte a motore spento ha precedenza sulla scadenza dei 200 ms.
+- In recupero, anche il fronte osservato esattamente alla scadenza viene
+  contato nel ciclo corrente e consumato: il timeout termina e si resta
+  in `ATTENDI_FRONTE` fino a un fronte successivo.
+- Con Corr non positiva, un fronte a motore spento ha precedenza sulla
+  scadenza dei 200 ms e genera il successivo B.
 
-Dopo il primo B, quindi, possono esserci altri bloccaggi anche con Corr
-positiva: il ritardo limitato riguarda il loro **avvio iniziale**.
-Quando il timeout scade senza nuovi fronti a motore spento, si passa a
-`MANTENIMENTO` e il conteggio del ciclo viene congelato. Se il mantenimento
-e' inibito, t_m e' zero e nello stesso loop si passa a `ATTENDI_FRONTE`,
-senza generare accensioni di mantenimento.
+La modalita' e' fissata all'ingresso dal solo valore di Corr, anche se il
+ciclo precedente ha eseguito mantenimenti. La condizione sul mantenimento
+precedente serve soltanto per il ritardo iniziale Av.
+Quando il timeout scade si prepara `MANTENIMENTO` e si congela il conteggio.
+In recupero t_m e' zero: nello stesso loop si passa a `ATTENDI_FRONTE`,
+senza ulteriori accensioni. Con i tempi iniziali, il timeout termina
+**350 ms dopo l'avvio effettivo dell'unico B**: 150 ms HIGH e 200 ms LOW,
+indipendentemente dai fronti ricevuti.
 
 ## Conteggi, tempi e mantenimento
 
@@ -126,10 +136,11 @@ La correzione si aggiorna soltanto all'ingresso; resta invariata durante
 l'attesa, i bloccaggi e il mantenimento. Si conserva il segno. Un errore
 positivo la aumenta; un errore negativo la diminuisce.
 
-**Se Corr e' positiva all'ingresso in MOTOR_ON, il mantenimento e' inibito
-per tutto quel ciclo**, anche se il ciclo precedente aveva mantenimenti e
-quindi il bloccaggio e' immediato. La decisione e' salvata in
-`mantenimentoInibito`: i fronti successivi non la cambiano. Questo evita
+**Se Corr e' positiva all'ingresso in MOTOR_ON, si esegue al massimo un
+bloccaggio e il mantenimento e' inibito per tutto quel ciclo**, anche se il
+ciclo precedente aveva mantenimenti e quindi il bloccaggio e' immediato.
+La decisione e' salvata nell'unico flag `recuperoAttivo`: i fronti successivi
+non la cambiano. Questo evita
 che i fronti accumulati durante attesa e arresto generino una nuova fase
 di mantenimento nello stesso ciclo. Con Corr zero o negativa, invece,
 si usa la formula normale.
@@ -138,7 +149,7 @@ Alla fine del bloccaggio:
 
 ```text
 On = ingresso MANTENIMENTO - ingresso MOTOR_ON
-t_m = 0                                                 se mantenimento_inibito
+t_m = 0                                                 se recupero
 t_m = max(n_attuale * MS_PER_FRONTE - On - Corr, 0)        altrimenti
 ```
 
@@ -249,7 +260,7 @@ questo campione con quello gia' letto nel main loop.
 ## Log e comandi seriali
 
 Monitor seriale a **115200 baud**. All'alimentazione o reset si stampa
-`Avvio freno - ritardo limitato e mantenimento inibito con Corr>0`, seguito
+`Avvio freno - Corr>0: un solo bloccaggio, niente mantenimento`, seguito
 dal valore del ritardo massimo e dalla legenda dei campi.
 Questo testo permette di riconoscere il firmware caricato. La legenda
 riporta **un campo per riga**; tutti i tempi sono in ms e Corr viene sempre
@@ -316,8 +327,9 @@ Dt, Np, Corr e Av si stampano una sola volta all'ingresso. Quando Av>1,
 questa riga compare prima di B, mentre il motore aspetta i fronti.
 I mantenimenti non ripetono la correzione.
 Con Corr positiva nel log d'ingresso, il riepilogo di quel ciclo deve
-mostrare sempre `Tm:0 M:0`, anche se Fr e' elevato. Con il limite iniziale
-di un fronte aggiuntivo, Av puo' valere soltanto 1 o 2.
+mostrare sempre `Tm:0 M:0`, anche se Fr e' elevato, e puo' esserci soltanto
+`B:1`. Il numero di fronti include quelli ricevuti nella pausa del timeout.
+Con il limite iniziale di un fronte aggiuntivo, Av puo' valere soltanto 1 o 2.
 
 Le righe vengono accodate in una coda di **quattro righe da massimo 63
 caratteri**. Alla fine del loop, dopo uscite e timer, la UART invia solo
@@ -364,10 +376,10 @@ mantenimenti da 100 ms ogni 600 ms e timeout da 200 ms.
 
 1. Al reset verificare il marcatore di avvio e `Ritardo massimo (fronti aggiuntivi): 1`.
 2. Registrare 20-30 cicli a carico basso: Corr positiva deve dare sempre
-   `Tm:0 M:0`; Av=2 soltanto dopo un ciclo senza mantenimenti.
+   un solo `B:1` e `Tm:0 M:0`; Av=2 soltanto dopo un ciclo senza mantenimenti.
 3. Provare un carico maggiore e poi variare il carico: tutti i fronti
-   devono essere contati; i B successivi restano consentiti; il mantenimento
-   torna disponibile quando Corr all'ingresso e' zero o negativa.
+   devono essere contati; i B successivi e il mantenimento tornano
+   disponibili quando Corr all'ingresso e' zero o negativa.
 4. Valutare la cadenza media con `somma(Dt) / somma(Np)`, escludendo la
    prima riga senza campione precedente, e osservare l'andamento di Corr.
    Se Corr continua a crescere con M=0, il limite di ritardo non e' sufficiente
@@ -378,7 +390,7 @@ la stessa prova. Non vengono modificati automaticamente gli altri tempi.
 
 ## Test simulati
 
-I **50 gruppi di test** simulati coprono GPIO, ISR, filtro/holdoff,
+I **52 gruppi di test** simulati coprono GPIO, ISR, filtro/holdoff,
 ONCE/ALWAYS, bloccaggi e timeout, conteggi separati, mantenimento regolare
 e interrompibile, formule e limiti, rollover, stop/riavvio e UART.
 Le verifiche dell'avvio limitato comprendono le soglie positive,
@@ -388,8 +400,11 @@ bloccaggio immediato dopo mantenimenti completati o interrotti anche con
 Corr positiva elevata, conteggio reale distinto dal numero nominale,
 inibizione del mantenimento anche dopo numerosi fronti nello stesso ciclo,
 ritorno al mantenimento quando Corr diventa zero o negativa, reset
-dell'inibizione dopo stop/riavvio, bloccaggi multipli dopo Av e tempi del log.
-Gli stessi 50 gruppi sono stati eseguiti anche su una copia dello sketch
+della modalita' recupero dopo stop/riavvio, un solo B con Corr positiva
+anche dopo un ciclo con mantenimenti, conteggio dei fronti a motore spento,
+assenza di retrigger e di riavvio al fronte coincidente con il timeout,
+bloccaggi multipli con Corr non positiva e tempi del log.
+Gli stessi 52 gruppi sono stati eseguiti anche su una copia dello sketch
 con limite di due fronti aggiuntivi. La legenda viene verificata
 con un campo per riga.
 La UART viene simulata anche mentre si riempie: Corr negativa resta in

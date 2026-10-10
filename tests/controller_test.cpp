@@ -133,7 +133,7 @@ static void startup_pins_and_defaults() {
   assert(MOTOR_ON_TIMEOUT_MS == 200 && PRE_GONFIAGGIO_MS == 1500);
   assert(correzioneTempoMs == 0 && frontiMotorOn == 0 && durataMantenimentoMs == 0);
   assert(fronteAvvioBloccaggio == 1);
-  assert(!mantenimentoInibito);
+  assert(!recuperoAttivo);
   assert(MAX_FRONTI_RITARDO_BLOCCAGGIO == 1 || MAX_FRONTI_RITARDO_BLOCCAGGIO == 2);
   assert(hardware::levels[11] == HIGH && hardware::levels[6] == HIGH);
   assert(hardware::levels[4] == LOW && hardware::levels[3] == HIGH);
@@ -142,7 +142,7 @@ static void startup_pins_and_defaults() {
   assert(PORTD.DIRCLR == PIN6_bm && PORTD.PIN6CTRL == 0);
   assert(PORTA.DIRCLR == PIN6_bm && PORTA.PIN6CTRL == 0);
   assert(hardware::interruptPin == 14 && hardware::interruptMode == CHANGE);
-  assert(Serial.output.find("Avvio freno - ritardo limitato e mantenimento inibito con Corr>0\n") == 0);
+  assert(Serial.output.find("Avvio freno - Corr>0: un solo bloccaggio, niente mantenimento\n") == 0);
   assert(Serial.output.find("Ritardo massimo (fronti aggiuntivi): " +
          std::to_string(MAX_FRONTI_RITARDO_BLOCCAGGIO) + "\n") != std::string::npos);
   assert(Serial.output.find("\nDt : delta t tra ingressi MOTOR_ON successivi\n") != std::string::npos);
@@ -309,13 +309,13 @@ static void elapsed_motor_on_time_includes_gaps_and_final_timeout() {
 static void positive_corr_disables_maintenance_and_negative_corr_extends_window() {
   first_episode(); edge(4000); edge(4010); edge(4020); tick(4150); tick(4350);
   assert(correzioneTempoMs == 400 && frontiPrecedenti == 1 && frontiMotorOn == 3);
-  assert(mantenimentoInibito && durataMantenimentoMs == 0 && indiceMantenimento == 0);
+  assert(recuperoAttivo && durataMantenimentoMs == 0 && indiceMantenimento == 0);
   assert(stato == ATTENDI_FRONTE); // La formula normale darebbe 1050 ms, ma Corr e' positiva.
   first_episode(1); edge(4300); edge(4310); edge(4320); tick(4450); tick(4650);
   assert(correzioneTempoMs == 100 && durataMantenimentoMs == 0 && numeroMantenimenti == 0);
   edge(4800); assert(correzioneTempoMs == -1200 && frontiPrecedenti == 3 && frontiMotorOn == 1);
   tick(4950); tick(5150);
-  assert(!mantenimentoInibito && durataMantenimentoMs == 1450); // 600 - 350 - (-1200).
+  assert(!recuperoAttivo && durataMantenimentoMs == 1450); // 600 - 350 - (-1200).
 }
 
 static void correction_accumulates_once_and_zero_error_preserves_it() {
@@ -326,9 +326,12 @@ static void correction_accumulates_once_and_zero_error_preserves_it() {
   assert(correzioneTempoMs == 300 && durataMantenimentoMs == 0);
   Serial.output.clear(); edge(6900);
   assert(ultimoPeriodoMs == 1200 && frontiPrecedenti == 2 && correzioneTempoMs == 300);
-  edge(6910); tick(7060); edge(7080); tick(7230); tick(7430);
+  edge(6910); tick(7060); edge(7080); tick(7259);
+  assert(stato == MOTOR_ON && numeroBloccaggi == 1 && ultimoSpegnimentoMs == 7060);
+  tick(7260);
   assert(correzioneTempoMs == 300 && occurrences(Serial.output, "Corr:") == 1);
   assert(frontiMotorOn == 3 && durataMantenimentoMs == 0 && stato == ATTENDI_FRONTE);
+  assert(durataMotorOnMs == 360 && tempoBloccaggioMs == 150);
 }
 
 static void short_windows_only_allow_full_pulses() {
@@ -345,7 +348,7 @@ static void short_windows_only_allow_full_pulses() {
     const Trace maintenance = observe(maintenanceStart, maintenanceStart + windows[i] + 1000);
     assert(block.lengths == std::vector<uint64_t>({150}));
     assert(maintenance.lengths == std::vector<uint64_t>(counts[i], 100));
-    assert(numeroMantenimenti == counts[i] && !mantenimentoInibito);
+    assert(numeroMantenimenti == counts[i] && !recuperoAttivo);
     assert(durataMantenimentoMs == windows[i] && stato == ATTENDI_FRONTE);
   }
 }
@@ -552,18 +555,18 @@ static void pending_encoder_edges_before_main_satisfy_threshold_once() {
   tick(5850); assert(hardware::levels[3] == LOW);
 }
 
-static void gate_counts_waiting_edges_then_normal_blocking_retriggers() {
+static void gated_positive_cycle_counts_edges_without_retrigger_or_maintenance() {
   previous_episode_without_maintenance(); Serial.output.clear(); correzioneTempoMs = 601; edge(5600);
   const Trace trace = observe(5600, 6221, {5650, 5720, 5730, 5872});
   const uint64_t firstOn = MAX_FRONTI_RITARDO_BLOCCAGGIO == 1 ? 5650 : 5720;
-  assert(trace.starts == std::vector<uint64_t>({firstOn, 5872}));
-  assert(trace.lengths == std::vector<uint64_t>({150, 150}));
-  assert(frontiMotorOn == 5 && numeroBloccaggi == 2 && fronteAvvioBloccaggio == 1 + MAX_FRONTI_RITARDO_BLOCCAGGIO);
-  assert(correzioneTempoMs == 601 && ultimoSpegnimentoMs == 6022);
+  assert(trace.starts == std::vector<uint64_t>({firstOn}));
+  assert(trace.lengths == std::vector<uint64_t>({150}));
+  assert(frontiMotorOn == 5 && numeroBloccaggi == 1 && fronteAvvioBloccaggio == 1 + MAX_FRONTI_RITARDO_BLOCCAGGIO);
+  assert(correzioneTempoMs == 601 && ultimoSpegnimentoMs == firstOn + 150);
   assert(Serial.output.find("B:1 Imp:150 Fr:    " + std::to_string(fronteAvvioBloccaggio) +
          " t:         0 d:         0") != std::string::npos);
   tick(6222);
-  assert(durataMotorOnMs == 622 && durataMantenimentoMs == 0 && tempoBloccaggioMs == 300);
+  assert(durataMotorOnMs == firstOn + 350 - 5600 && durataMantenimentoMs == 0 && tempoBloccaggioMs == 150);
   assert(stato == ATTENDI_FRONTE && numeroMantenimenti == 0 && indiceMantenimento == 0);
   assert(Serial.output.find("M:") != std::string::npos); // Riepilogo con M:0.
   assert(Serial.output.find("M:1/") == std::string::npos);
@@ -579,7 +582,7 @@ static void positive_corr_after_active_maintenance_starts_without_low_glitch() {
   assert(inizioSequenzaMs == 4580 && fronteAvvioBloccaggio == 1 && inizioBloccaggioMs == 4580);
   edge(4590); edge(4600); tick(4730); tick(4930);
   assert(frontiMotorOn == 3 && durataMotorOnMs == 350 && durataMantenimentoMs == 0);
-  assert(stato == ATTENDI_FRONTE && mantenimentoInibito && indiceMantenimento == 0);
+  assert(stato == ATTENDI_FRONTE && recuperoAttivo && indiceMantenimento == 0);
 }
 
 static void completed_maintenance_prevents_delay_even_with_large_positive_corr() {
@@ -594,8 +597,12 @@ static void completed_maintenance_prevents_delay_even_with_large_positive_corr()
       assert(inizioSequenzaMs == nextStart && inizioBloccaggioMs == nextStart);
       tick(nextStart + 149); assert(hardware::levels[3] == HIGH);
       tick(nextStart + 150); assert(hardware::levels[3] == LOW);
-      tick(nextStart + 350);
+      edge(nextStart + 175);
+      assert(stato == MOTOR_ON && numeroBloccaggi == 1 && hardware::levels[3] == LOW);
+      tick(nextStart + 349); assert(stato == MOTOR_ON);
+      edge(nextStart + 350); // Questo fronte si conta, ma non riavvia il ciclo alla scadenza.
       assert(stato == ATTENDI_FRONTE && durataMantenimentoMs == 0 && indiceMantenimento == 0);
+      assert(frontiMotorOn == 3 && numeroBloccaggi == 1 && ultimoSpegnimentoMs == nextStart + 150);
       assert(Serial.output.find(" Av:1\n") != std::string::npos);
     }
   }
@@ -624,9 +631,9 @@ static void maintenance_resumes_after_corr_becomes_nonpositive() {
   assert(fronteAvvioBloccaggio == 2 && hardware::levels[3] == LOW);
   edge(5700); tick(5850); tick(6050);
   assert(durataMotorOnMs == 450 && durataMantenimentoMs == 0 && indiceMantenimento == 0);
-  assert(stato == ATTENDI_FRONTE && mantenimentoInibito);
+  assert(stato == ATTENDI_FRONTE && recuperoAttivo);
   edge(6200); // Dt=600, Np=2: Corr passa da +600 a zero.
-  assert(correzioneTempoMs == 0 && fronteAvvioBloccaggio == 1 && !mantenimentoInibito);
+  assert(correzioneTempoMs == 0 && fronteAvvioBloccaggio == 1 && !recuperoAttivo);
   assert(numeroBloccaggi == 1 && hardware::levels[3] == HIGH && inizioBloccaggioMs == 6200);
   edge(6210); edge(6220); tick(6350); tick(6550);
   assert(stato == MANTENIMENTO && durataMantenimentoMs == 1450 && indiceMantenimento == 1);
@@ -636,7 +643,7 @@ static void maintenance_resumes_after_corr_becomes_nonpositive() {
 
 static void positive_entry_never_generates_maintenance_after_many_encoder_edges() {
   first_episode(1); Serial.output.clear(); edge(4201);
-  assert(correzioneTempoMs == 1 && mantenimentoInibito && fronteAvvioBloccaggio == 1);
+  assert(correzioneTempoMs == 1 && recuperoAttivo && fronteAvvioBloccaggio == 1);
   std::vector<uint64_t> edges;
   for (uint64_t i = 0; i < 32; ++i) edges.push_back(4203 + 2 * i);
   const Trace trace = observe(4201, 5200, edges);
@@ -648,6 +655,50 @@ static void positive_entry_never_generates_maintenance_after_many_encoder_edges(
   assert(occurrences(Serial.output, "Corr:") == 1 && Serial.output.find("M:1/") == std::string::npos);
 }
 
+static void positive_off_edges_do_not_retrigger_or_open_new_cycle_at_timeout() {
+  first_episode(); Serial.output.clear(); correzioneTempoMs = 1; edge(3600);
+  const Trace trace = observe(3600, 3950, {3610, 3620, 3760, 3780, 3948, 3950});
+  assert(trace.starts == std::vector<uint64_t>({3600}) && trace.lengths == std::vector<uint64_t>({150}));
+  assert(stato == ATTENDI_FRONTE && numeroBloccaggi == 1 && hardware::levels[3] == LOW);
+  assert(frontiMotorOn == 7 && ultimoSpegnimentoMs == 3750 && durataMotorOnMs == 350);
+  assert(correzioneTempoMs == 1 && occurrences(Serial.output, "Corr:") == 1);
+  assert(durataMantenimentoMs == 0 && indiceMantenimento == 0);
+  tick(3951); assert(stato == ATTENDI_FRONTE && hardware::levels[3] == LOW);
+  edge(3952); // Solo un nuovo fronte dopo il timeout apre un altro MOTOR_ON.
+  assert(stato == MOTOR_ON && numeroBloccaggi == 1 && hardware::levels[3] == HIGH);
+  assert(frontiPrecedenti == 7 && frontiMotorOn == 1 && correzioneTempoMs == -3847);
+  assert(!recuperoAttivo && occurrences(Serial.output, "Corr:") == 2);
+}
+
+static void blocking_repeats_only_when_corr_at_entry_is_nonpositive() {
+  for (const int correction : {-1, 0, 1, 600, 22675}) {
+    previous_episode_without_maintenance(); Serial.output.clear(); correzioneTempoMs = correction;
+    edge(5600); edge(5610); edge(5620);
+    const uint64_t firstOn = inizioBloccaggioMs;
+    assert(numeroBloccaggi == 1 && frontiMotorOn == 3 && correzioneTempoMs == correction);
+    tick(firstOn + 150); assert(hardware::levels[3] == LOW);
+    edge(firstOn + 170);
+    if (correction > 0) {
+      assert(recuperoAttivo && numeroBloccaggi == 1 && hardware::levels[3] == LOW);
+      assert(ultimoSpegnimentoMs == firstOn + 150);
+    } else {
+      assert(!recuperoAttivo && numeroBloccaggi == 2 && hardware::levels[3] == HIGH);
+    }
+    tick(firstOn + 320); edge(firstOn + 350);
+    assert(frontiMotorOn == 5 && correzioneTempoMs == correction);
+    assert(occurrences(Serial.output, "Corr:") == 1);
+    if (correction > 0) {
+      assert(stato == ATTENDI_FRONTE && numeroBloccaggi == 1 && hardware::levels[3] == LOW);
+      assert(durataMotorOnMs == firstOn + 350 - 5600 && durataMantenimentoMs == 0);
+    } else {
+      assert(stato == MOTOR_ON && numeroBloccaggi == 3 && hardware::levels[3] == HIGH);
+      assert(ultimoSpegnimentoMs == firstOn + 320); // Il secondo B ha retriggerato il timeout.
+      tick(firstOn + 500); tick(firstOn + 699); assert(stato == MOTOR_ON);
+      tick(firstOn + 700); assert(stato == MANTENIMENTO && indiceMantenimento == 1);
+    }
+  }
+}
+
 static void restart_clears_inhibition_from_all_positive_corr_phases() {
   for (const unsigned phase : {0, 1, 2, 3}) {
     previous_episode_without_maintenance(); correzioneTempoMs = 601; edge(5600);
@@ -655,12 +706,12 @@ static void restart_clears_inhibition_from_all_positive_corr_phases() {
     if (phase >= 1) { edge(5700); edge(5710); stopTime = 5711; }
     if (phase >= 2) { tick(5860); stopTime = 5861; }
     if (phase >= 3) { tick(6060); stopTime = 6061; assert(stato == ATTENDI_FRONTE); }
-    assert(mantenimentoInibito);
+    assert(recuperoAttivo);
     Serial.receive("s"); tick(stopTime); assert(stato == FERMO && hardware::levels[3] == LOW);
     Serial.receive("a"); tick(7000);
-    assert(stato == PRE_GONFIAGGIO && !mantenimentoInibito && correzioneTempoMs == 0);
+    assert(stato == PRE_GONFIAGGIO && !recuperoAttivo && correzioneTempoMs == 0);
     ready(7000); edge(9000); tick(9150); tick(9350);
-    assert(stato == MANTENIMENTO && !mantenimentoInibito && indiceMantenimento == 1);
+    assert(stato == MANTENIMENTO && !recuperoAttivo && indiceMantenimento == 1);
     assert(durataMantenimentoMs == 250 && hardware::levels[3] == HIGH);
   }
 }
@@ -766,7 +817,7 @@ static void low_load_model_with_long_release_exposes_limit_of_capped_delay() {
   // Anche senza mantenimenti, il rilascio lungo non permette 600 ms/fronte
   // con uno o due fronti di ritardo: documenta il limite, senza fingere convergenza.
   assert(meanMs > 1000 && correzioneTempoMs > 100000 && maxCorr == correzioneTempoMs);
-  assert(mantenimentoInibito && indiceMantenimento == 0 && durataMantenimentoMs == 0);
+  assert(recuperoAttivo && indiceMantenimento == 0 && durataMantenimentoMs == 0);
   std::cout << "Modello basso carico, limite " << unsigned(MAX_FRONTI_RITARDO_BLOCCAGGIO)
             << " fronti, rilascio 3000 ms: media " << meanMs
             << " ms/fronte, Corr massima " << maxCorr << " ms\n";
@@ -836,12 +887,14 @@ int main() {
   proportional_start_thresholds_and_reported_corrections();
   second_or_third_front_starts_first_pulse_without_wait_timeout();
   pending_encoder_edges_before_main_satisfy_threshold_once();
-  gate_counts_waiting_edges_then_normal_blocking_retriggers();
+  gated_positive_cycle_counts_edges_without_retrigger_or_maintenance();
   positive_corr_after_active_maintenance_starts_without_low_glitch();
   completed_maintenance_prevents_delay_even_with_large_positive_corr();
   no_maintenance_uses_updated_corr_and_actual_pulse_count();
   maintenance_resumes_after_corr_becomes_nonpositive();
   positive_entry_never_generates_maintenance_after_many_encoder_edges();
+  positive_off_edges_do_not_retrigger_or_open_new_cycle_at_timeout();
+  blocking_repeats_only_when_corr_at_entry_is_nonpositive();
   restart_clears_inhibition_from_all_positive_corr_phases();
   negative_and_zero_corr_start_immediately_and_logs_keep_sign();
   stop_during_gate_then_restart_resets_wait();
@@ -851,5 +904,5 @@ int main() {
   full_log_queue_never_blocks_motor_or_overwrites_rows();
   low_load_model_with_long_release_exposes_limit_of_capped_delay();
   fixed_release_delay_model_keeps_mean_cadence_near_target();
-  std::cout << "50 gruppi di test PASS (simulazione, non validazione del prototipo)\n";
+  std::cout << "52 gruppi di test PASS (simulazione, non validazione del prototipo)\n";
 }
