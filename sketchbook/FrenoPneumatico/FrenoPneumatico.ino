@@ -12,9 +12,9 @@ constexpr uint32_t PRE_GONFIAGGIO_MS = 1500;
 constexpr uint32_t MOTOR_ON_TIMEOUT_MS = 200;   // Dalla fine dell'ultimo impulso di bloccaggio.
 constexpr uint32_t MS_PER_FRONTE = 600;
 constexpr uint32_t MS_CORR_PER_FRONTE_ATTESO = MS_PER_FRONTE; // Correzione per ogni fronte aggiuntivo, entro il limite seguente.
-constexpr uint8_t MAX_FRONTI_RITARDO_BLOCCAGGIO = 1; // 1: al massimo secondo fronte; 2: al massimo terzo.
-constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 150;
-constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 100;
+constexpr uint8_t MAX_FRONTI_RITARDO_BLOCCAGGIO = 2; // 1: al massimo secondo fronte; 2: al massimo terzo.
+constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 100;
+constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 70;
 constexpr uint32_t INTERVALLO_MANTENIMENTO_MS = 600; // Fra due avvii, indipendente dall'obiettivo.
 static_assert(IMPULSO_BLOCCAGGIO_MS > 0 && IMPULSO_MANTENIMENTO_MS > 0 &&
               INTERVALLO_MANTENIMENTO_MS > IMPULSO_MANTENIMENTO_MS &&
@@ -274,7 +274,8 @@ void aggiornaFreno(uint32_t now) {
           recuperoAttivo = correzioneTempoMs > 0;
           fronteAvvioBloccaggio = senzaMantenimentoPrima
                                  ? calcolaFronteAvvio(correzioneTempoMs) : 1;
-          // Con mantenimenti precedenti Av=1: riparti subito, senza un passaggio LOW.
+          // Basta un mantenimento avviato nel ciclo precedente per imporre Av=1,
+          // anche con Corr positiva: riparti subito, senza un passaggio LOW.
           if (frontiMotorOn < fronteAvvioBloccaggio) digitalWrite(MOTOR_PIN, LOW);
         }
         // ALWAYS: prima del primo B conta tutti i fronti, senza far partire il timeout.
