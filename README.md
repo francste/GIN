@@ -17,25 +17,25 @@ stateDiagram-v2
     MOTOR_ON --> MANTENIMENTO: 200 ms dall'ultimo spegnimento B
     MANTENIMENTO --> MANTENIMENTO: impulsi da 100 ms ogni 600 ms
     MANTENIMENTO --> MOTOR_ON: primo fronte valido
-    MANTENIMENTO --> ATTENDI_FRONTE: scadenza t_m
+    MANTENIMENTO --> ATTENDI_FRONTE: scadenza t_m, subito con Corr ingresso positiva
 ```
 
 | Stato | ONCE | ALWAYS |
 | --- | --- | --- |
 | `PRE_GONFIAGGIO` | Azzera campioni e correzione; accende il motore | Dopo 1500 ms passa a `ATTENDI_FRONTE` |
 | `ATTENDI_FRONTE` | Spegne il motore | Al primo fronte passa a `MOTOR_ON` |
-| `MOTOR_ON` | Salva se il ciclo precedente ha eseguito mantenimenti; memorizza Dt, aggiorna Corr, sceglie Av e inizia il nuovo n | Primo B immediato, oppure attende Av solo con Corr positiva e nessun mantenimento precedente; poi bloccaggi da 150 ms; dopo 200 ms dall'ultimo spegnimento passa al mantenimento |
-| `MANTENIMENTO` | Calcola t_m dal nuovo n e dal tempo completo in MOTOR_ON | Impulsi da 100 ms ogni 600 ms; al primo fronte torna a `MOTOR_ON`; a fine t_m passa a `ATTENDI_FRONTE` |
+| `MOTOR_ON` | Salva se il ciclo precedente ha eseguito mantenimenti; memorizza Dt, aggiorna Corr, sceglie Av, congela l'inibizione del mantenimento e inizia il nuovo n | Primo B immediato, oppure attende Av entro il limite di fronti; poi bloccaggi da 150 ms; dopo 200 ms dall'ultimo spegnimento prepara il mantenimento |
+| `MANTENIMENTO` | Calcola t_m; lo forza a zero se Corr era positiva all'ingresso in MOTOR_ON | Con t_m=0 passa subito a `ATTENDI_FRONTE`; altrimenti impulsi da 100 ms ogni 600 ms; al primo fronte torna a `MOTOR_ON`; a fine t_m passa a `ATTENDI_FRONTE` |
 | `FERMO` | Spegne il motore | Attende il comando `a` |
 
 Ogni transizione esegue il ONCE del nuovo stato nello stesso loop.
 I fronti del pregonfiaggio vengono consumati, compreso quello osservato
 nel loop che lo termina: serve un nuovo fronte dopo l'ingresso in attesa.
 
-## Primo bloccaggio proporzionale alla correzione
+## Ritardo limitato del primo bloccaggio
 
 All'ingresso in `MOTOR_ON`, il controllo aggiorna la correzione accumulata
-prima di decidere quando generare il primo bloccaggio. L'attesa proporzionale
+prima di decidere quando generare il primo bloccaggio. L'attesa
 si applica **solo con Corr positiva e nessun impulso di mantenimento
 realmente avviato nel ciclo precedente**. Se il ciclo precedente ha eseguito
 anche un solo mantenimento, il primo fronte accende subito il bloccaggio,
@@ -52,24 +52,26 @@ Dt = ingresso MOTOR_ON attuale - ingresso MOTOR_ON precedente
 Corr += Dt - n_precedente * MS_PER_FRONTE
 ritarda = ciclo_precedente_valido && mantenimenti_avviati_precedenti == 0 && Corr > 0
 Av = 1                                         se non ritarda
-Av = 1 + ceil(Corr / MS_CORR_PER_FRONTE_ATTESO)   se ritarda
+Av = 1 + min(ceil(Corr / MS_CORR_PER_FRONTE_ATTESO), MAX_FRONTI_RITARDO_BLOCCAGGIO)   se ritarda
+mantenimento_inibito = Corr > 0
 ```
 
 `MS_CORR_PER_FRONTE_ATTESO` vale inizialmente **600 ms**, come
 `MS_PER_FRONTE`, ma puo' essere regolato separatamente. `Av` e' il numero
 cumulativo di fronti necessario per la **prima** accensione del ciclo.
-Il fronte che ha causato l'ingresso e' gia' il numero 1. La tabella seguente
-si applica quando il ciclo precedente **non ha avviato mantenimenti**:
+Il fronte che ha causato l'ingresso e' gia' il numero 1.
+`MAX_FRONTI_RITARDO_BLOCCAGGIO` vale **1**: al massimo un fronte aggiuntivo,
+quindi il primo B parte al secondo fronte. Impostandolo a **2** si consente
+il terzo fronte, quando la correzione supera 600 ms. Non vengono aggiunte
+attese crescenti quando Corr e' molto grande.
 
-| Corr all'ingresso | Primo bloccaggio |
-| --- | --- |
-| Negativa o zero | Primo fronte, subito nel main loop |
-| Da 1 a 600 ms | Secondo fronte |
-| Da 601 a 1200 ms | Terzo fronte |
-| 1400 ms | Quarto fronte |
-| 22675 ms | 39esimo fronte |
-| 23336 ms | 40esimo fronte |
-| 23789 ms | 41esimo fronte |
+La tabella si applica quando il ciclo precedente **non ha avviato mantenimenti**:
+
+| Corr all'ingresso | Limite 1, predefinito | Limite 2 |
+| --- | --- | --- |
+| Negativa o zero | Primo fronte, subito | Primo fronte, subito |
+| Da 1 a 600 ms | Secondo fronte | Secondo fronte |
+| Maggiore di 600 ms, anche 22675 ms | Secondo fronte | Terzo fronte |
 
 `Av` resta invariato per tutto quel `MOTOR_ON`. Tutti i fronti in attesa
 vengono contati; al raggiungimento della soglia il motore si accende nello
@@ -88,8 +90,8 @@ Questa strategia permette al freno di muoversi prima della prima frenata
 quando la sola fase di bloccaggio frena troppo e non vengono eseguiti
 mantenimenti. Il maggiore n del ciclo contribuisce a ridurre
 la correzione al prossimo ingresso. Non si azzera artificialmente Corr.
-La scelta del bloccaggio singolo e il campo S della versione precedente
-sono stati sostituiti dall'avvio proporzionale, riconoscibile dal campo Av.
+L'efficacia dipende dalla risposta fisica: il limite dei fronti evita
+attese troppo lunghe, ma non garantisce il recupero della correzione.
 
 ## Bloccaggi dopo il raggiungimento di Av
 
@@ -106,9 +108,11 @@ il valore rimane parametrico. Alla fine il motore si spegne e riparte
 - Un fronte a motore spento ha precedenza sulla scadenza dei 200 ms.
 
 Dopo il primo B, quindi, possono esserci altri bloccaggi anche con Corr
-positiva: il ritardo proporzionale riguarda il loro **avvio iniziale**.
+positiva: il ritardo limitato riguarda il loro **avvio iniziale**.
 Quando il timeout scade senza nuovi fronti a motore spento, si passa a
-`MANTENIMENTO` e il conteggio del ciclo viene congelato.
+`MANTENIMENTO` e il conteggio del ciclo viene congelato. Se il mantenimento
+e' inibito, t_m e' zero e nello stesso loop si passa a `ATTENDI_FRONTE`,
+senza generare accensioni di mantenimento.
 
 ## Conteggi, tempi e mantenimento
 
@@ -122,11 +126,20 @@ La correzione si aggiorna soltanto all'ingresso; resta invariata durante
 l'attesa, i bloccaggi e il mantenimento. Si conserva il segno. Un errore
 positivo la aumenta; un errore negativo la diminuisce.
 
+**Se Corr e' positiva all'ingresso in MOTOR_ON, il mantenimento e' inibito
+per tutto quel ciclo**, anche se il ciclo precedente aveva mantenimenti e
+quindi il bloccaggio e' immediato. La decisione e' salvata in
+`mantenimentoInibito`: i fronti successivi non la cambiano. Questo evita
+che i fronti accumulati durante attesa e arresto generino una nuova fase
+di mantenimento nello stesso ciclo. Con Corr zero o negativa, invece,
+si usa la formula normale.
+
 Alla fine del bloccaggio:
 
 ```text
 On = ingresso MANTENIMENTO - ingresso MOTOR_ON
-t_m = max(n_attuale * MS_PER_FRONTE - On - Corr, 0)
+t_m = 0                                                 se mantenimento_inibito
+t_m = max(n_attuale * MS_PER_FRONTE - On - Corr, 0)        altrimenti
 ```
 
 `On` e' il tempo completo nello stato: **attesa di Av, accensioni,
@@ -155,12 +168,13 @@ anche se B parte piu' tardi. I timestamp del log `t` partono invece dal
 la distanza fra avvii effettivi, anche se qualche riga viene persa.
 
 Esempio con Corr=600 ms e nessun mantenimento nel ciclo precedente: Av=2.
-Se il secondo fronte arriva 100 ms dopo
-l'ingresso, B parte allora; si spegne a 250 ms e il timeout termina a
-450 ms. Con n=2, t_m=1200-450-600=150 ms e M=1. Il mantenimento parte
-450 ms dall'ingresso, ma il suo log mostra t=350 ms dal primo B. Avendo
-eseguito quel mantenimento, il ciclo successivo parte al primo fronte,
-anche se Corr rimane positiva.
+Se il secondo fronte arriva 100 ms dopo l'ingresso, B parte allora;
+si spegne a 250 ms e il timeout termina a 450 ms. Con n=2 la formula normale
+darebbe 1200-450-600=150 ms di mantenimento. Poiche' Corr era positiva,
+si forza invece t_m=0: il riepilogo mostra `On:450 Tm:0 M:0` e si attende
+il prossimo fronte. Tutti i fronti restano contati per la correzione
+al prossimo ingresso. Il mantenimento torna disponibile nel primo ciclo
+che entra con Corr zero o negativa.
 
 ## Coerenza e limiti
 
@@ -169,15 +183,18 @@ sono discreti, quindi possono produrre cicli alternati intorno all'obiettivo.
 L'obiettivo e' **600 ms per fronte accettato**; CHANGE conta salita e
 discesa, se entrambi superano il filtro.
 
-Con carichi bassi che non richiedono mantenimenti, aspettare piu' fronti
-permette di recuperare una correzione positiva senza ripetere la prima frenata troppo
-presto. Il recupero dipende dai fronti e dalla risposta fisica effettivi:
+Con carichi bassi che non richiedono mantenimenti, aspettare uno o due
+fronti aggiuntivi puo' aiutare a recuperare una correzione positiva senza
+ripetere la prima frenata troppo presto. Il recupero dipende dai fronti e dalla risposta fisica effettivi:
 se il freno libero genera fronti piu' lentamente dell'obiettivo, il
 controllo non puo' crearne di aggiuntivi. Senza nuovi fronti durante
-l'attesa di Av, il motore resta spento.
+l'attesa di Av, il motore resta spento. Se anche il solo bloccaggio
+trattiene troppo a lungo il freno, Corr puo' continuare a crescere nonostante
+il mantenimento sia assente. Questa prova non cambia la durata dei B.
 
 I calcoli usano 64 bit con segno; Corr e' limitata al campo numerico
-`-UINT32_MAX..UINT32_MAX` ms, t_m a `0..UINT32_MAX` ms e Av a UINT32_MAX.
+`-UINT32_MAX..UINT32_MAX` ms, t_m a `0..UINT32_MAX` ms e Av a 2, oppure 3
+quando il limite e' configurato a due fronti aggiuntivi.
 I timer e il conteggio supportano il rollover con intervalli inferiori
 a un giro completo. Non viene ripristinato il vecchio limite di richiesta
 motore a 2000 ms.
@@ -193,6 +210,7 @@ motore a 2000 ms.
 | `INTERVALLO_MANTENIMENTO_MS` | 600 | Distanza fra avvii di mantenimento |
 | `MS_PER_FRONTE` | 600 | Cadenza media obiettivo |
 | `MS_CORR_PER_FRONTE_ATTESO` | 600 | Correzione per ogni fronte aggiuntivo prima di B, solo senza mantenimenti precedenti |
+| `MAX_FRONTI_RITARDO_BLOCCAGGIO` | 1 | Limite di fronti aggiuntivi prima del primo B; valori consentiti 1 o 2 |
 | `ENCODER_HOLDOFF_US` | 2000 | Tempo minimo fra fronti accettati |
 
 ## Collegamenti e ISR
@@ -231,8 +249,8 @@ questo campione con quello gia' letto nel main loop.
 ## Log e comandi seriali
 
 Monitor seriale a **115200 baud**. All'alimentazione o reset si stampa
-`Avvio freno - ritardo solo senza mantenimenti precedenti`, seguito dalla
-legenda dei campi.
+`Avvio freno - ritardo limitato e mantenimento inibito con Corr>0`, seguito
+dal valore del ritardo massimo e dalla legenda dei campi.
 Questo testo permette di riconoscere il firmware caricato. La legenda
 riporta **un campo per riga**; tutti i tempi sono in ms e Corr viene sempre
 stampata con segno, positiva, zero o negativa:
@@ -297,6 +315,9 @@ M:2/2 t:      1290 d:       600
 Dt, Np, Corr e Av si stampano una sola volta all'ingresso. Quando Av>1,
 questa riga compare prima di B, mentre il motore aspetta i fronti.
 I mantenimenti non ripetono la correzione.
+Con Corr positiva nel log d'ingresso, il riepilogo di quel ciclo deve
+mostrare sempre `Tm:0 M:0`, anche se Fr e' elevato. Con il limite iniziale
+di un fronte aggiuntivo, Av puo' valere soltanto 1 o 2.
 
 Le righe vengono accodate in una coda di **quattro righe da massimo 63
 caratteri**. Alla fine del loop, dopo uscite e timer, la UART invia solo
@@ -336,27 +357,57 @@ La toolchain cloud e' Arduino CLI 1.4.1, megaAVR 1.8.8, API 1.3.1 e AVR GCC
 Debian 14.2.0, diverso dal compilatore del pacchetto Arduino standard.
 Il caricamento USB non e' verificato.
 
-I **48 gruppi di test** simulati coprono GPIO, ISR, filtro/holdoff,
+## Prova sul prototipo
+
+Iniziare con `MAX_FRONTI_RITARDO_BLOCCAGGIO = 1`, B da 150 ms,
+mantenimenti da 100 ms ogni 600 ms e timeout da 200 ms.
+
+1. Al reset verificare il marcatore di avvio e `Ritardo massimo (fronti aggiuntivi): 1`.
+2. Registrare 20-30 cicli a carico basso: Corr positiva deve dare sempre
+   `Tm:0 M:0`; Av=2 soltanto dopo un ciclo senza mantenimenti.
+3. Provare un carico maggiore e poi variare il carico: tutti i fronti
+   devono essere contati; i B successivi restano consentiti; il mantenimento
+   torna disponibile quando Corr all'ingresso e' zero o negativa.
+4. Valutare la cadenza media con `somma(Dt) / somma(Np)`, escludendo la
+   prima riga senza campione precedente, e osservare l'andamento di Corr.
+   Se Corr continua a crescere con M=0, il limite di ritardo non e' sufficiente
+   a compensare la frenata di bloccaggio.
+
+Per confrontare il limite 2, cambiare soltanto quel parametro e ripetere
+la stessa prova. Non vengono modificati automaticamente gli altri tempi.
+
+## Test simulati
+
+I **50 gruppi di test** simulati coprono GPIO, ISR, filtro/holdoff,
 ONCE/ALWAYS, bloccaggi e timeout, conteggi separati, mantenimento regolare
 e interrompibile, formule e limiti, rollover, stop/riavvio e UART.
-Le verifiche dell'avvio proporzionale comprendono le soglie positive,
+Le verifiche dell'avvio limitato comprendono le soglie positive,
 zero e negative, il secondo/terzo fronte, i valori Corr del log riportato,
 assenza di timeout prima del primo B, fronti accumulati prima del main,
 bloccaggio immediato dopo mantenimenti completati o interrotti anche con
 Corr positiva elevata, conteggio reale distinto dal numero nominale,
-ritorno all'avvio immediato dopo un ciclo ritardato che esegue mantenimento,
-bloccaggi multipli dopo Av e tempi del log. La legenda viene verificata
+inibizione del mantenimento anche dopo numerosi fronti nello stesso ciclo,
+ritorno al mantenimento quando Corr diventa zero o negativa, reset
+dell'inibizione dopo stop/riavvio, bloccaggi multipli dopo Av e tempi del log.
+Gli stessi 50 gruppi sono stati eseguiti anche su una copia dello sketch
+con limite di due fronti aggiuntivi. La legenda viene verificata
 con un campo per riga.
 La UART viene simulata anche mentre si riempie: Corr negativa resta in
 coda dopo B e viene emessa appena c'e' spazio; la coda piena non blocca
 il controllo e non sovrascrive le righe pendenti.
 
-Nel modello a basso carico, il freno libero genera un fronte ogni 100 ms
-ed e' rilasciato 3000 ms dopo LOW. Su 300 cicli, la nuova strategia ottiene
-circa **601,6 ms per fronte** e mantiene la correzione massima a **5450 ms**.
-Il modello con quattro fronti per movimento e rilascio dopo 800 ms
-misura **602 ms per fronte** su 100 cicli. Sono risultati simulati;
-la risposta e la stabilita' del prototipo reale richiedono verifica hardware.
+Il modello con quattro fronti per movimento e rilascio dopo 800 ms misura
+**597,5 ms per fronte** su 100 cicli, con Corr finale di -1000 ms.
+Il modello a basso carico, con un fronte ogni 100 ms a freno libero e
+rilascio 3000 ms dopo LOW, mostra invece il limite della proposta:
+su 300 cicli misura **1630,6 ms per fronte** con limite 1 e **1121,5 ms**
+con limite 2. Corr continua a crescere, rispettivamente fino a 616300 e
+467300 ms, mentre il mantenimento rimane inibito. Con quella risposta
+fisica il solo bloccaggio trattiene troppo a lungo per raggiungere 600 ms
+per fronte usando al massimo due fronti aggiuntivi. Il test registra questa
+limitazione, senza richiedere una convergenza che l'algoritmo non produce.
+Sono modelli idealizzati; la risposta e la stabilita' del prototipo reale
+richiedono la prova hardware.
 
 ```sh
 set -e

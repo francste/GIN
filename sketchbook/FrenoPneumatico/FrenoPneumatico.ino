@@ -11,7 +11,8 @@ constexpr uint32_t ENCODER_HOLDOFF_US = 2000;
 constexpr uint32_t PRE_GONFIAGGIO_MS = 1500;
 constexpr uint32_t MOTOR_ON_TIMEOUT_MS = 200;   // Dalla fine dell'ultimo impulso di bloccaggio.
 constexpr uint32_t MS_PER_FRONTE = 600;
-constexpr uint32_t MS_CORR_PER_FRONTE_ATTESO = MS_PER_FRONTE; // Solo senza mantenimenti precedenti: un fronte in piu' ogni 600 ms positivi.
+constexpr uint32_t MS_CORR_PER_FRONTE_ATTESO = MS_PER_FRONTE; // Correzione per ogni fronte aggiuntivo, entro il limite seguente.
+constexpr uint8_t MAX_FRONTI_RITARDO_BLOCCAGGIO = 1; // 1: al massimo secondo fronte; 2: al massimo terzo.
 constexpr uint16_t IMPULSO_BLOCCAGGIO_MS = 150;
 constexpr uint16_t IMPULSO_MANTENIMENTO_MS = 100;
 constexpr uint32_t INTERVALLO_MANTENIMENTO_MS = 600; // Fra due avvii, indipendente dall'obiettivo.
@@ -19,6 +20,8 @@ static_assert(IMPULSO_BLOCCAGGIO_MS > 0 && IMPULSO_MANTENIMENTO_MS > 0 &&
               INTERVALLO_MANTENIMENTO_MS > IMPULSO_MANTENIMENTO_MS &&
               MOTOR_ON_TIMEOUT_MS > 0 && MS_PER_FRONTE > 0 && MS_CORR_PER_FRONTE_ATTESO > 0,
               "Servono durate positive e una pausa fra i mantenimenti");
+static_assert(MAX_FRONTI_RITARDO_BLOCCAGGIO >= 1 && MAX_FRONTI_RITARDO_BLOCCAGGIO <= 2,
+              "Il ritardo massimo deve essere di uno o due fronti aggiuntivi");
 
 enum Stato { PRE_GONFIAGGIO, ATTENDI_FRONTE, MOTOR_ON, MANTENIMENTO, FERMO };
 Stato stato = FERMO;
@@ -40,6 +43,7 @@ uint32_t frontiMotorOn = 0;                   // n attuale, compreso il fronte i
 uint32_t totalePrimaMotorOn = 0;              // Base del conteggio: prima del fronte iniziale.
 int64_t correzioneTempoMs = 0;                // t_corr accumulata, anche negativa.
 uint32_t durataMotorOnMs = 0;                 // Tempo nello stato, accensioni + pause + timeout.
+bool mantenimentoInibito = false;            // Corr > 0 all'ingresso: nessun mantenimento in questo ciclo.
 
 bool bloccaggioAcceso = false;
 uint32_t fronteAvvioBloccaggio = 1;           // Fronte atteso per il primo B, fissato all'ingresso.
@@ -160,9 +164,10 @@ uint32_t limitaDurataMs(int64_t durataMs) {
 
 uint32_t calcolaFronteAvvio(int64_t correzioneMs) {
   if (correzioneMs <= 0) return 1;             // Primo fronte: bloccaggio immediato.
-  const uint64_t fronti = 1 + (uint64_t(correzioneMs) + MS_CORR_PER_FRONTE_ATTESO - 1) /
-                            MS_CORR_PER_FRONTE_ATTESO;
-  return fronti > UINT32_MAX ? UINT32_MAX : uint32_t(fronti);
+  const uint64_t ritardo = (uint64_t(correzioneMs) + MS_CORR_PER_FRONTE_ATTESO - 1) /
+                          MS_CORR_PER_FRONTE_ATTESO;
+  return 1 + uint32_t(ritardo > MAX_FRONTI_RITARDO_BLOCCAGGIO
+                      ? MAX_FRONTI_RITARDO_BLOCCAGGIO : ritardo);
 }
 
 void accendiBloccaggio() {
@@ -197,7 +202,8 @@ void preparaMantenimento() {
   durataMotorOnMs = uint32_t(inizioMantenimentoMs - inizioSequenzaMs);
   const int64_t tempoMs = int64_t(frontiMotorOn) * MS_PER_FRONTE -
                          durataMotorOnMs - correzioneTempoMs;
-  durataMantenimentoMs = limitaDurataMs(tempoMs);
+  // La decisione e' congelata all'ingresso: nuovi fronti non riabilitano il mantenimento.
+  durataMantenimentoMs = mantenimentoInibito ? 0 : limitaDurataMs(tempoMs);
   // Primo mantenimento all'ingresso; gli altri ogni 600 ms. Soltanto impulsi completi.
   numeroMantenimenti = durataMantenimentoMs < IMPULSO_MANTENIMENTO_MS ? 0 :
                       1 + (durataMantenimentoMs - IMPULSO_MANTENIMENTO_MS) / INTERVALLO_MANTENIMENTO_MS;
@@ -222,6 +228,7 @@ void aggiornaFreno(uint32_t now) {
         if (once) {                            // ONCE: ripristina e accendi il pregonfiaggio.
           precedenteSequenzaValida = false;
           correzioneTempoMs = 0;
+          mantenimentoInibito = false;
           ultimoPeriodoMs = frontiPrecedenti = frontiMotorOn = 0;
           durataMotorOnMs = durataMantenimentoMs = 0;
           numeroBloccaggi = tempoBloccaggioMs = 0;
@@ -264,6 +271,7 @@ void aggiornaFreno(uint32_t now) {
           durataMotorOnMs = durataMantenimentoMs = 0;
           inizioSequenzaMs = inizioStatoMs = millis();
           memorizzaIntervallo(primaDeiFronti);
+          mantenimentoInibito = correzioneTempoMs > 0;
           fronteAvvioBloccaggio = senzaMantenimentoPrima
                                  ? calcolaFronteAvvio(correzioneTempoMs) : 1;
           // Con mantenimenti precedenti Av=1: riparti subito, senza un passaggio LOW.
@@ -369,7 +377,9 @@ void setup() {
   digitalWrite(DEBUG_PIN, digitalRead(ENCODER_PIN));
   attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), encoderISR, CHANGE);
   Serial.begin(115200);
-  Serial.println(F("Avvio freno - ritardo solo senza mantenimenti precedenti"));
+  Serial.println(F("Avvio freno - ritardo limitato e mantenimento inibito con Corr>0"));
+  Serial.print(F("Ritardo massimo (fronti aggiuntivi): "));
+  Serial.println(MAX_FRONTI_RITARDO_BLOCCAGGIO);
   Serial.println(F("Legenda log (tempi in ms):"));
   Serial.println(F("Dt : delta t tra ingressi MOTOR_ON successivi"));
   Serial.println(F("Np : fronti contati nel MOTOR_ON precedente"));
